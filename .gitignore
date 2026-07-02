@@ -4,7 +4,9 @@
 node_modules/               # Node.js dependencies
 /vendor/                    # PHP Composer or Go dependencies
 .venv/                      # Python virtual environments
+venv/                        # Alternate Python virtual environments
 env/                        # Alternate Python virtual environments
+.streamlit/
 
 # ---------------------------------------------------------------------------
 # Build Outputs & Compiled Code
