@@ -40,6 +40,14 @@ for native device-camera capture on phones.
   Multiple servings supported (scale the whole label by portion size).
 - 📊 **Clear visual output** — `st.metric`, `st.progress`, and color-coded
   categories for at-a-glance results.
+- 💾 **Saved food database** — save any scanned/entered food with a name,
+  category, optional brand, and free-form tags (SQLite, no external
+  service needed). Search saved foods by any combination of those fields
+  and load one back in a click, skipping OCR entirely on repeat foods.
+- ⌨️ **Autocomplete everywhere** — every name/category/brand/tag field
+  (both when saving and when searching) fuzzy-filters your existing
+  values as you type, and lets you type a brand-new value if nothing
+  matches, via Streamlit's `accept_new_options`.
 - 🛡️ **Defensive engineering** — corrupted images, empty labels, zero
   weight/height, and unknown activity levels are all handled without
   crashing the app.
@@ -54,20 +62,25 @@ nutrilens/
 ├── modules/
 │   ├── calculations.py        # Pure-Python metabolic/nutrition math (UI-independent)
 │   ├── ocr_parser.py          # OCR text extraction + regex field parsing
+│   ├── database.py            # SQLite CRUD + search for saved foods (UI-independent)
 │   └── user_profile.py        # Sidebar UI for collecting profile inputs
 ├── tests/
 │   ├── test_calculations.py   # 33 unit tests for the calculation engine
-│   └── test_ocr_parser.py     # 8 unit tests for label text parsing
+│   ├── test_ocr_parser.py     # 8 unit tests for label text parsing
+│   └── test_database.py       # 29 unit tests for the food database
+├── data/                      # Created automatically; holds nutrilens.db (gitignored)
 ├── .streamlit/
 │   └── config.toml            # Theme + server configuration
 ├── requirements.txt           # Python dependencies
 ├── packages.txt               # System (apt) dependency: tesseract-ocr binary
+├── .gitignore
 └── README.md
 ```
 
-The calculation engine (`modules/calculations.py`) has **zero Streamlit
-dependency**, so it can be unit tested, reused in a CLI, or swapped into a
-different frontend without modification.
+The calculation engine (`modules/calculations.py`) and the database layer
+(`modules/database.py`) have **zero Streamlit dependency**, so they can be
+unit tested, reused in a CLI, or swapped into a different frontend
+without modification.
 
 ---
 
@@ -148,6 +161,44 @@ reference and bucketed into Low (<20) / Medium (20–45) / High (≥45).
 
 ---
 
+## Saved food database & search
+
+Every scanned or manually-entered food can be saved with:
+
+- **Name** (required)
+- **Category** (optional — e.g. Dairy, Snack, Beverage; a starter list of
+  common categories is suggested even before you've saved anything)
+- **Brand** (optional)
+- **Tags** (optional, any number — e.g. `high-protein`, `breakfast`,
+  `gluten-free`)
+- All 7 nutrition fields, per serving
+
+Saved foods live in a local SQLite file at `data/nutrilens.db`, created
+automatically on first run — no external database or API key needed.
+
+**Searching:** the "🔎 Search your saved foods" panel lets you filter by
+any combination of name, category, brand, and tags, then pick a match
+from the results and load it straight into the current scan — skipping
+the camera/OCR step entirely for foods you've logged before.
+
+**Autocomplete:** every name/category/brand/tag field (both when saving
+and when searching) is a fuzzy-filterable dropdown — start typing and
+matching existing values narrow down live — and you can always type a
+brand-new value if nothing matches, via `st.selectbox`/`st.multiselect`
+with `accept_new_options=True`. Fields fall back to a plain text input
+only when there are zero existing values yet to suggest.
+
+> ⚠️ **Streamlit Community Cloud note:** that platform's filesystem is
+> ephemeral, so `data/nutrilens.db` is wiped on every app restart or
+> redeploy there. For durable multi-user persistence in production,
+> replace the connection logic in `modules/database.py` with a hosted
+> database (e.g. Postgres/Supabase) — the function signatures used by
+> `app.py` (`save_food`, `search_foods`, `get_distinct_*`, etc.) can stay
+> the same. Running locally, or on any host with a persistent disk, the
+> SQLite file persists normally across restarts.
+
+---
+
 ## Scientific basis & limitations
 
 This app deliberately uses **published, named formulas** (Mifflin-St
@@ -183,11 +234,16 @@ qualified healthcare provider before making decisions based on this app.
 A few ideas that would meaningfully improve usability beyond the current
 scope:
 
-- **Meal history & trends** — log scanned foods over a day/week and chart
-  cumulative insulin load and caloric balance (`st.session_state` +
-  a simple CSV/SQLite log), rather than only showing single-item results.
+- **Daily meal log & trends** — beyond one-off saved foods, log what was
+  actually *eaten* with a timestamp, and chart cumulative insulin load
+  and caloric balance over a day/week (the `foods` table could grow a
+  companion `meal_log` table referencing it).
 - **Barcode scanning fallback** — for packaged foods, look up
-  Open Food Facts by barcode as a higher-accuracy alternative to OCR.
+  Open Food Facts by barcode as a higher-accuracy alternative to OCR, and
+  auto-fill brand/category from the lookup.
+- **Per-user accounts** — the current database is single-user/local; a
+  hosted DB (see the note above) plus simple auth would let each person
+  have their own saved-food library.
 - **Personalized insulin sensitivity input** — let users with a known
   HOMA-IR or clinical insulin-sensitivity value scale the estimate.
 - **Multi-language OCR** — add `easyocr` or `tesseract` language packs for
@@ -206,7 +262,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-41 unit tests cover:
+70 unit tests cover:
 - Unit conversions (kg↔lb, ft/in↔cm)
 - BMI, Deurenberg body-fat %, Mifflin-St Jeor BMR/TDEE (including
   known-value checks and edge cases: zero height, negative inputs,
@@ -219,12 +275,25 @@ pytest tests/ -v
   plus the zero-weight guard
 - OCR regex parsing against clean, noisy, partial, decimal-comma, and
   garbage/empty text inputs
+- Food database: save/retrieve/delete, required-name validation, search
+  by name/category/brand/tags individually and combined (AND logic
+  across filters, ANY-match within tags), result ordering and limits,
+  and autocomplete value lookups (including empty-database and
+  duplicate/whitespace-tag edge cases)
 
-All 41 tests pass. The app was also smoke-tested end-to-end: launched
-headlessly, confirmed a clean HTTP 200 boot with no runtime exceptions,
-and run through the full image → OCR → parse → predict pipeline using
-both a clear synthetic label (7/7 fields extracted correctly) and a noisy
-one (partial extraction, correctly triggering the manual-correction UI).
+All 70 tests pass. The app was also smoke-tested end-to-end: launched
+headlessly from multiple working directories, confirmed a clean HTTP 200
+boot with no runtime exceptions, and run through the full image → OCR →
+parse → predict pipeline using both a clear synthetic label (7/7 fields
+extracted correctly) and a noisy one (partial extraction, correctly
+triggering the manual-correction UI). The autocomplete fields were
+specifically designed and tested against a real Streamlit edge case:
+an empty-options `st.selectbox`/`st.multiselect` with
+`accept_new_options=True` can disable free-text entry in some versions,
+so those fields fall back to a plain text input until at least one value
+exists to suggest — and each fallback mode uses a distinct widget key so
+the field can never crash from a session-state type mismatch as the
+option pool grows between reruns.
 
 ---
 

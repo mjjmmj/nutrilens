@@ -13,6 +13,14 @@ entry) and produces two algorithmic, educational projections:
 
 from __future__ import annotations
 
+import os
+import sys
+
+# Ensure the folder containing this file (and therefore `modules/`) is on
+# sys.path, regardless of the working directory `streamlit run` was
+# launched from. This prevents "No module named 'modules'" errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import pandas as pd
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
@@ -30,6 +38,19 @@ from modules.ocr_parser import (
     ParsedNutrition,
 )
 from modules.user_profile import render_profile_sidebar, show_resolved_profile_notice
+from modules.database import (
+    FoodEntry,
+    init_db,
+    save_food,
+    search_foods,
+    get_distinct_names,
+    get_distinct_categories,
+    get_distinct_brands,
+    get_distinct_tags,
+    count_foods,
+)
+
+init_db()
 
 
 # --------------------------------------------------------------------------- #
@@ -60,6 +81,71 @@ if "raw_ocr_text" not in st.session_state:
     st.session_state.raw_ocr_text = ""
 if "ocr_fields_found" not in st.session_state:
     st.session_state.ocr_fields_found = None
+
+
+def _autocomplete_select(
+    label: str,
+    options: list,
+    key: str,
+    placeholder: str = "Type to search or add new...",
+    help_text: str | None = None,
+):
+    """A single-value autocomplete field: fuzzy-filters existing `options`
+    as the user types, and lets them enter a brand-new value if nothing
+    matches (via accept_new_options). Falls back to a plain text input
+    when there are no existing options yet, since some Streamlit versions
+    disable free-text entry on an empty-options selectbox.
+
+    NOTE: the two branches use different suffixed widget keys
+    (`{key}__select` / `{key}__text`) rather than sharing `key` directly.
+    The option pool can grow between reruns (e.g. right after a save),
+    which would otherwise flip this field from the text_input branch to
+    the selectbox branch while session_state still held a plain string
+    under that key -- multiselect/selectbox expect a different shape and
+    would raise a StreamlitAPIException. Distinct keys per branch avoid
+    that entirely.
+    """
+    if options:
+        return st.selectbox(
+            label,
+            options=options,
+            index=None,
+            key=f"{key}__select",
+            placeholder=placeholder,
+            accept_new_options=True,
+            filter_mode="fuzzy",
+            help=help_text,
+        )
+    return st.text_input(label, key=f"{key}__text", placeholder=placeholder, help=help_text) or None
+
+
+def _autocomplete_multiselect(
+    label: str,
+    options: list,
+    key: str,
+    placeholder: str = "Type to search or add new tags...",
+    help_text: str | None = None,
+) -> list:
+    """Multi-value autocomplete for tags: fuzzy-filters existing tags and
+    allows adding brand-new ones. Falls back to a comma-separated text
+    input when the tag vocabulary is still empty. See `_autocomplete_select`
+    for why the two branches use distinct suffixed keys."""
+    if options:
+        return st.multiselect(
+            label,
+            options=options,
+            default=[],
+            key=f"{key}__multiselect",
+            placeholder=placeholder,
+            accept_new_options=True,
+            filter_mode="fuzzy",
+            help=help_text,
+        )
+    raw = st.text_input(
+        label, key=f"{key}__text", placeholder="e.g. high-protein, breakfast, gluten-free",
+        help=help_text,
+    )
+    return [t.strip() for t in raw.split(",") if t.strip()] if raw else []
 
 
 def _apply_parsed_to_session(parsed: ParsedNutrition) -> None:
@@ -127,6 +213,98 @@ with st.sidebar.expander("📊 Your calculated baseline"):
     st.metric("TDEE (kcal/day)", f"{baseline.tdee_kcal:.0f}")
     st.caption(f"Hourly baseline burn: {baseline.hourly_baseline_kcal:.1f} kcal/hr")
 
+
+# --------------------------------------------------------------------------- #
+# Search saved foods (convenient re-entry, skips OCR entirely)
+# --------------------------------------------------------------------------- #
+
+saved_count = count_foods()
+
+with st.expander(
+    f"🔎 Search your saved foods ({saved_count} saved)" if saved_count
+    else "🔎 Search your saved foods (none saved yet)",
+    expanded=False,
+):
+    if saved_count == 0:
+        st.caption(
+            "Nothing saved yet — scan or enter a food below, then use "
+            "'💾 Save this food' to add it here for quick reuse next time."
+        )
+    else:
+        st.caption("Filter by any combination of fields below.")
+        s_col1, s_col2 = st.columns(2)
+        with s_col1:
+            search_name = _autocomplete_select(
+                "Food name", get_distinct_names(), key="search_name",
+                placeholder="Type to search by name...",
+            )
+            search_brand = _autocomplete_select(
+                "Brand", get_distinct_brands(), key="search_brand",
+                placeholder="Type to search by brand...",
+            )
+        with s_col2:
+            search_category = _autocomplete_select(
+                "Category", get_distinct_categories(), key="search_category",
+                placeholder="Type to search by category...",
+            )
+            search_tags = _autocomplete_multiselect(
+                "Tags", get_distinct_tags(), key="search_tags",
+                placeholder="Type to search by tag...",
+            )
+
+        results = search_foods(
+            name=search_name, category=search_category,
+            brand=search_brand, tags=search_tags, limit=25,
+        )
+
+        if not results:
+            st.info("No saved foods match those filters yet.")
+        else:
+            def _format_result(food: FoodEntry) -> str:
+                bits = [food.name]
+                meta = [b for b in [food.brand, food.category] if b]
+                if meta:
+                    bits.append(f"({', '.join(meta)})")
+                return " ".join(bits)
+
+            options_map = {_format_result(f): f for f in results}
+            choice_label = st.selectbox(
+                f"{len(results)} match(es) — pick one to load",
+                options=list(options_map.keys()),
+                index=None,
+                placeholder="Select a saved food to load its nutrition facts...",
+                key="search_result_choice",
+            )
+            if choice_label:
+                chosen = options_map[choice_label]
+                load_col, delete_col = st.columns([2, 1])
+                with load_col:
+                    if st.button("⬇️ Load into current scan", use_container_width=True):
+                        st.session_state.nutrition_values = {
+                            "Serving Size (g)": chosen.serving_size_g,
+                            "Calories": chosen.calories,
+                            "Total Carbs (g)": chosen.total_carbs_g,
+                            "Dietary Fiber (g)": chosen.fiber_g,
+                            "Sugars (g)": chosen.sugars_g,
+                            "Protein (g)": chosen.protein_g,
+                            "Total Fat (g)": chosen.total_fat_g,
+                        }
+                        st.session_state.raw_ocr_text = ""
+                        st.success(
+                            f"Loaded '{chosen.name}' — scroll down to review and see "
+                            "predictions. (It's already saved, so the save form below "
+                            "starts blank; only fill it in again if you want to save "
+                            "a modified version as a new entry.)"
+                        )
+                        st.rerun()
+                with delete_col:
+                    if st.button("🗑️ Delete", use_container_width=True):
+                        from modules.database import delete_food
+                        delete_food(chosen.id)
+                        st.success(f"Deleted '{chosen.name}'.")
+                        st.rerun()
+
+st.divider()
 
 # --------------------------------------------------------------------------- #
 # Image capture / upload
@@ -244,6 +422,65 @@ with reset_col:
 
 
 # --------------------------------------------------------------------------- #
+# Save this food to the database
+# --------------------------------------------------------------------------- #
+
+st.divider()
+st.subheader("3. Save this food for next time (optional)")
+st.caption(
+    "Give it a name and any tags so you can find and reload it later "
+    "without rescanning."
+)
+
+save_col1, save_col2 = st.columns(2)
+with save_col1:
+    food_name_input = _autocomplete_select(
+        "Food name *", get_distinct_names(), key="food_name",
+        placeholder="e.g. Chobani Greek Yogurt",
+    )
+    food_brand_input = _autocomplete_select(
+        "Brand (optional)", get_distinct_brands(), key="food_brand",
+        placeholder="e.g. Chobani",
+    )
+with save_col2:
+    food_category_input = _autocomplete_select(
+        "Category (optional)", get_distinct_categories(), key="food_category",
+        placeholder="e.g. Dairy",
+    )
+    food_tags_input = _autocomplete_multiselect(
+        "Tags (optional)", get_distinct_tags(), key="food_tags",
+        placeholder="e.g. high-protein, breakfast",
+    )
+
+if st.button("💾 Save this food", type="primary"):
+    v = st.session_state.nutrition_values
+    if not food_name_input or not str(food_name_input).strip():
+        st.error("Please enter a food name before saving.")
+    else:
+        try:
+            new_id = save_food(
+                FoodEntry(
+                    name=str(food_name_input).strip(),
+                    category=food_category_input,
+                    brand=food_brand_input,
+                    tags=food_tags_input or [],
+                    serving_size_g=v["Serving Size (g)"] or 100.0,
+                    calories=v["Calories"],
+                    total_carbs_g=v["Total Carbs (g)"],
+                    fiber_g=v["Dietary Fiber (g)"],
+                    sugars_g=v["Sugars (g)"],
+                    protein_g=v["Protein (g)"],
+                    total_fat_g=v["Total Fat (g)"],
+                )
+            )
+            st.success(f"Saved '{food_name_input}' to your food database (#{new_id}).")
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Could not save this food: {exc}")
+
+
+# --------------------------------------------------------------------------- #
 # Build NutritionFacts and validate
 # --------------------------------------------------------------------------- #
 
@@ -264,7 +501,7 @@ has_any_data = any(
 )
 
 st.divider()
-st.subheader("3. Predicted acute impact")
+st.subheader("4. Predicted acute impact")
 
 if not has_any_data:
     st.info("Enter or scan nutrition values above to see predictions.")
