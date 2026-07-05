@@ -27,7 +27,15 @@ for native device-camera capture on phones.
 - 🔍 **OCR label parsing** — extracts serving size, calories, carbs, fiber,
   sugars, protein, and fat via `pytesseract`, with tolerant regex parsing
   that handles common OCR noise (missing spaces, punctuation, decimal
-  commas, varying label wording).
+  commas, varying label wording). Supports **English and Japanese
+  (日本語)** labels in a single pass, including mixed-language labels.
+- 📷 **Built for real camera photos, not just clean scans** — corrects
+  EXIF orientation (phones tag rotation as metadata rather than rotating
+  pixels, which silently defeats OCR on portrait photos), and tries
+  multiple preprocessing variants (contrast/sharpen, Otsu binarization,
+  plain grayscale) per photo, automatically keeping whichever one parses
+  the most fields — this matters a lot under real-world lighting, glare,
+  and slight blur.
 - ✏️ **Manual override** — every OCR'd value lands in an editable
   `st.data_editor` table so users can correct misreads before calculating.
   If OCR finds nothing (blurry photo, no OCR engine installed, etc.), the
@@ -95,10 +103,12 @@ source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 # 3. Install the Tesseract OCR binary (pytesseract is just a wrapper —
-#    it needs the actual `tesseract` executable on your system)
-#    macOS:    brew install tesseract
-#    Ubuntu:   sudo apt-get install tesseract-ocr
+#    it needs the actual `tesseract` executable on your system), plus the
+#    Japanese trained-data files for Japanese label support:
+#    macOS:    brew install tesseract tesseract-lang
+#    Ubuntu:   sudo apt-get install tesseract-ocr tesseract-ocr-jpn tesseract-ocr-jpn-vert
 #    Windows:  https://github.com/UB-Mannheim/tesseract/wiki
+#              (select "Japanese" in the installer's language options)
 
 # 4. Run the app
 streamlit run app.py
@@ -118,10 +128,15 @@ test camera capture on a real device.
 3. Streamlit Cloud automatically:
    - installs everything in `requirements.txt`, and
    - installs everything in `packages.txt` via `apt-get` — this is what
-     provides the `tesseract-ocr` binary that `pytesseract` calls out to.
-     **Don't skip `packages.txt`** — without it, `pytesseract` will raise
-     `TesseractNotFoundError` in the cloud environment (the app catches
-     this gracefully and falls back to manual entry, but OCR won't work).
+     provides the `tesseract-ocr` binary and the `tesseract-ocr-jpn` /
+     `tesseract-ocr-jpn-vert` Japanese trained-data files that
+     `pytesseract` calls out to. **Don't skip `packages.txt`** — without
+     it, `pytesseract` will raise `TesseractNotFoundError` in the cloud
+     environment (the app catches this gracefully and falls back to
+     manual entry, but OCR won't work), and without the `-jpn` packages
+     specifically, Japanese labels will silently fail to parse even
+     though English labels work fine (the app shows a warning banner in
+     this case, via `tesseract_japanese_available()`).
 
 No secrets or API keys are required — everything runs locally in the
 Streamlit process.
@@ -199,6 +214,47 @@ only when there are zero existing values yet to suggest.
 
 ---
 
+## OCR reliability on real camera photos
+
+Clean, flat scans OCR easily; real phone photos are a different problem —
+rotation metadata, uneven lighting, glare, and slight blur all degrade
+recognition. Two concrete fixes address this:
+
+1. **EXIF orientation correction.** Phones store rotation as EXIF
+   metadata rather than rotating the actual pixels. Without correcting
+   for it, a portrait photo can OCR as sideways or upside-down text —
+   which reliably produces zero readable fields. `modules/ocr_parser.py`
+   applies `ImageOps.exif_transpose()` before any OCR pass.
+2. **Multiple preprocessing variants per photo.** A single fixed
+   preprocessing recipe (e.g. "always binarize") helps some photos and
+   hurts others, depending on lighting. Each photo is now processed three
+   ways — contrast-enhanced + sharpened, Otsu-binarized (automatic
+   threshold, robust to glare/shadow), and plain grayscale — each is
+   OCR'd, and whichever result parses the most nutrition fields is kept.
+
+**Japanese (日本語) label support** was added alongside these fixes:
+
+- Both OCR backends run in combined English + Japanese mode
+  (`lang="eng+jpn"` for tesseract, `["en", "ja"]` for EasyOCR), so mixed
+  or either-language labels are read in one pass.
+- Field-matching regexes were extended with Japanese label wording
+  (エネルギー / たんぱく質 / 脂質 / 炭水化物 / 食物繊維 / 糖類, plus the
+  蛋白質 kanji variant for protein) and are **whitespace-tolerant between
+  every character** — Tesseract's Japanese engine frequently inserts
+  stray spaces as word-segmentation artifacts (e.g. "エネルギー" → "エネ
+  ルギー"), which would silently break an exact-string match.
+- Full-width digits and punctuation (e.g. "１８０ｋｃａｌ", common with
+  Japanese input methods) are normalized to standard ASCII via Unicode
+  NFKC normalization before parsing.
+- Some Japanese labels report a carbohydrate *breakdown* (糖質 + 食物繊維)
+  instead of a single 炭水化物 total; when no direct total is found, it's
+  derived automatically as 糖質 + 食物繊維.
+- `tesseract_japanese_available()` checks whether the `jpn` trained-data
+  file is actually installed and surfaces a clear warning in the app if
+  it's missing, rather than silently reading Japanese labels as garbage.
+
+---
+
 ## Scientific basis & limitations
 
 This app deliberately uses **published, named formulas** (Mifflin-St
@@ -262,7 +318,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-70 unit tests cover:
+85 unit tests cover:
 - Unit conversions (kg↔lb, ft/in↔cm)
 - BMI, Deurenberg body-fat %, Mifflin-St Jeor BMR/TDEE (including
   known-value checks and edge cases: zero height, negative inputs,
@@ -274,20 +330,33 @@ pytest tests/ -v
 - Body-fat change projection for both surplus and deficit scenarios,
   plus the zero-weight guard
 - OCR regex parsing against clean, noisy, partial, decimal-comma, and
-  garbage/empty text inputs
+  garbage/empty English text inputs
+- **Japanese label parsing**: clean labels, OCR-inserted-whitespace
+  tolerance, the 糖質+食物繊維 carbohydrate-breakdown fallback (and that a
+  direct 炭水化物 total correctly takes precedence over it), full-width
+  digit normalization, mixed English/Japanese labels, and the 蛋白質
+  kanji variant for protein
+- **Image preprocessing**: EXIF orientation correction (including a
+  round-trip through a real JPEG with an orientation tag), huge-image
+  downscaling, small-image upscaling, Otsu binarization producing
+  pure black/white output, RGBA input handling, and that multiple
+  preprocessing variants are generated per photo
 - Food database: save/retrieve/delete, required-name validation, search
   by name/category/brand/tags individually and combined (AND logic
   across filters, ANY-match within tags), result ordering and limits,
   and autocomplete value lookups (including empty-database and
   duplicate/whitespace-tag edge cases)
 
-All 70 tests pass. The app was also smoke-tested end-to-end: launched
+All 85 tests pass. The app was also smoke-tested end-to-end: launched
 headlessly from multiple working directories, confirmed a clean HTTP 200
 boot with no runtime exceptions, and run through the full image → OCR →
-parse → predict pipeline using both a clear synthetic label (7/7 fields
-extracted correctly) and a noisy one (partial extraction, correctly
-triggering the manual-correction UI). The autocomplete fields were
-specifically designed and tested against a real Streamlit edge case:
+parse → predict pipeline using a clear synthetic label (7/7 fields),
+a synthetic label rotated 90° with a real EXIF orientation tag (verified
+this fails completely — 0/7 fields — without the orientation fix, and
+recovers to 7/7 with it), and a Japanese label (verified the initial
+whitespace-tolerance bug — 3/7 fields — and its fix — 7/7 fields — with a
+real OCR run against rendered Japanese text). The autocomplete fields
+were specifically designed and tested against a real Streamlit edge case:
 an empty-options `st.selectbox`/`st.multiselect` with
 `accept_new_options=True` can disable free-text entry in some versions,
 so those fields fall back to a plain text input until at least one value

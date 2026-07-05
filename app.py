@@ -35,6 +35,7 @@ from modules.calculations import (
 from modules.ocr_parser import (
     extract_nutrition_from_image,
     ocr_backends_available,
+    tesseract_japanese_available,
     ParsedNutrition,
 )
 from modules.user_profile import render_profile_sidebar, show_resolved_profile_notice
@@ -311,12 +312,21 @@ st.divider()
 # --------------------------------------------------------------------------- #
 
 st.subheader("1. Capture or upload the nutrition label")
+st.caption("Supports English and Japanese (日本語) labels.")
 
 backends = ocr_backends_available()
 if not any(backends.values()):
     st.info(
         "No OCR engine (pytesseract / easyocr) was detected in this "
         "environment. You can still enter nutrition values manually below."
+    )
+elif backends.get("pytesseract") and not tesseract_japanese_available():
+    st.warning(
+        "Japanese OCR support (tesseract's `jpn` trained data) isn't "
+        "installed in this environment, so Japanese labels won't be read "
+        "correctly yet — English labels are unaffected. If you're "
+        "deploying this app yourself, make sure `packages.txt` includes "
+        "`tesseract-ocr-jpn` (see README)."
     )
 
 tab_camera, tab_upload = st.tabs(["📷 Use Camera", "📁 Upload from Gallery"])
