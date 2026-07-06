@@ -36,6 +36,12 @@ for native device-camera capture on phones.
   plain grayscale) per photo, automatically keeping whichever one parses
   the most fields — this matters a lot under real-world lighting, glare,
   and slight blur.
+- ☁️ **Optional cloud OCR engines** — for photos the local engine still
+  struggles with, switch to Baidu Unlimited-OCR (a free Hugging Face
+  Space, no key needed) or Mistral's official OCR API (your own key,
+  paid) right from the same dropdown. Both feed into the exact same
+  bilingual/full-nutrient parser as local OCR. See the dedicated section
+  below for the tradeoffs before relying on either.
 - ✏️ **Manual override** — every OCR'd value lands in an editable
   `st.data_editor` table so users can correct misreads before calculating.
   If OCR finds nothing (blurry photo, no OCR engine installed, etc.), the
@@ -52,6 +58,18 @@ for native device-camera capture on phones.
   category, optional brand, and free-form tags (SQLite, no external
   service needed). Search saved foods by any combination of those fields
   and load one back in a click, skipping OCR entirely on repeat foods.
+  Stores the **full nutrition panel** (see below), not just macros.
+- 📋 **Full nutrition panel, not just macros** — captures and saves the
+  complete standard label: saturated/trans fat, cholesterol, sodium,
+  added sugars, vitamin D, calcium, iron, and potassium, alongside the 7
+  core macros. These extra fields aren't used in the insulin/body-fat
+  math (which only needs the macros), but they're extracted from OCR when
+  present, editable, saved, and viewable in a consolidated panel.
+- 🌐 **Public food database lookup** — search
+  [Open Food Facts](https://world.openfoodfacts.org) (free, no API key,
+  millions of branded products) by product name and load a match's full
+  nutrition data directly — no photo needed at all for well-known
+  packaged foods.
 - ⌨️ **Autocomplete everywhere** — every name/category/brand/tag field
   (both when saving and when searching) fuzzy-filters your existing
   values as you type, and lets you type a brand-new value if nothing
@@ -69,26 +87,31 @@ nutrilens/
 ├── app.py                     # Main Streamlit application (UI + orchestration)
 ├── modules/
 │   ├── calculations.py        # Pure-Python metabolic/nutrition math (UI-independent)
-│   ├── ocr_parser.py          # OCR text extraction + regex field parsing
+│   ├── ocr_parser.py          # Local OCR text extraction + regex field parsing
+│   ├── cloud_ocr.py           # Optional cloud OCR backends (Baidu, Mistral)
 │   ├── database.py            # SQLite CRUD + search for saved foods (UI-independent)
+│   ├── food_database_api.py   # Open Food Facts integration (UI-independent)
 │   └── user_profile.py        # Sidebar UI for collecting profile inputs
 ├── tests/
-│   ├── test_calculations.py   # 33 unit tests for the calculation engine
-│   ├── test_ocr_parser.py     # 8 unit tests for label text parsing
-│   └── test_database.py       # 29 unit tests for the food database
+│   ├── test_calculations.py    # Unit tests for the calculation engine
+│   ├── test_ocr_parser.py      # Unit tests for label text parsing (EN + JP)
+│   ├── test_cloud_ocr.py       # Unit tests for cloud OCR (mocked HTTP/gradio_client)
+│   ├── test_database.py        # Unit tests for the food database
+│   └── test_food_database_api.py  # Unit tests for Open Food Facts (mocked HTTP)
 ├── data/                      # Created automatically; holds nutrilens.db (gitignored)
 ├── .streamlit/
 │   └── config.toml            # Theme + server configuration
 ├── requirements.txt           # Python dependencies
-├── packages.txt               # System (apt) dependency: tesseract-ocr binary
+├── packages.txt               # System (apt) dependencies: tesseract-ocr + jpn language data
 ├── .gitignore
 └── README.md
 ```
 
-The calculation engine (`modules/calculations.py`) and the database layer
-(`modules/database.py`) have **zero Streamlit dependency**, so they can be
-unit tested, reused in a CLI, or swapped into a different frontend
-without modification.
+The calculation engine (`modules/calculations.py`), the database layer
+(`modules/database.py`), and the public food database client
+(`modules/food_database_api.py`) have **zero Streamlit dependency**, so
+they can be unit tested, reused in a CLI, or swapped into a different
+frontend without modification.
 
 ---
 
@@ -214,6 +237,119 @@ only when there are zero existing values yet to suggest.
 
 ---
 
+## Full nutrient panel & public database lookup
+
+**Beyond the 7 macros**, NutriLens now captures the complete standard
+nutrition label:
+
+| Field | Unit | Used in predictions? |
+|---|---|---|
+| Serving size, calories, carbs, fiber, sugars, protein, fat | g / kcal | ✅ yes |
+| Saturated fat, trans fat | g | Saved only |
+| Cholesterol, sodium | mg | Saved only |
+| Added sugars | g | Saved only |
+| Vitamin D | mcg | Saved only |
+| Calcium, iron, potassium | mg | Saved only |
+
+The extended fields aren't part of the insulin/body-fat math (which only
+needs the macros), but they're extracted by OCR when present on the
+label, editable in an "➕ Additional nutrients" section, saved to the
+database, and viewable together in a "📋 Full nutrition panel" summary.
+OCR patterns for these fields cover both English and Japanese label
+wording, including the 食塩相当量 → sodium (mg) conversion Japanese labels
+require (see the OCR reliability section above).
+
+**Auto-extraction from a public food database:** the
+"🌐 Search a public food database" panel queries
+[Open Food Facts](https://world.openfoodfacts.org) — a free,
+community-maintained database of millions of branded products, no API
+key required — by product name, and loads a match's full nutrition data
+(including the extended fields where OFF has them) with one click. This
+is the fastest path for common packaged foods and doesn't need a photo
+at all.
+
+A few implementation notes:
+- OFF reports nutrients per 100g and, when available, per serving; the
+  per-serving values are preferred when present (`modules/food_database_api.py`),
+  falling back to per-100g otherwise (with serving size defaulting to 100g).
+- OFF stores sodium and cholesterol in grams like everything else; this
+  app converts them to mg for consistency with US label conventions and
+  the rest of the app.
+- Since Open Food Facts is crowd-sourced, data quality varies — treat a
+  loaded result the same way you'd treat an OCR scan: a starting point to
+  review, not an authoritative source. All values remain fully editable
+  after loading.
+- Every food record also stores where its data came from
+  (`source`: "Open Food Facts" or "Manual/OCR"), shown next to the save
+  form when it isn't your own manual entry.
+- All network calls are wrapped in try/except and return an empty
+  result on any failure (no internet, timeout, product not found) —
+  the app falls back to a friendly "no matches" message rather than
+  crashing, and the search/parsing logic is fully unit tested against
+  mocked HTTP responses so it doesn't depend on OFF's live uptime.
+
+---
+
+## Optional cloud OCR engines
+
+Local OCR (Tesseract/EasyOCR) is the default: it's free, private (nothing
+leaves the device/server), and works offline. For photos it still
+struggles with — heavy blur, steep angles, poor lighting — the "OCR
+engine" dropdown above the camera/upload tabs offers two cloud
+alternatives, both larger vision-language models that can handle messier
+input than a traditional OCR engine:
+
+1. **Baidu Unlimited-OCR** — a free
+   [Hugging Face Space](https://huggingface.co/spaces/baidu/Unlimited-OCR),
+   no API key needed. Called via the `gradio_client` package.
+2. **Mistral OCR** — Mistral's official commercial OCR API, using your
+   own API key from [console.mistral.ai](https://console.mistral.ai/).
+
+Both return plain text that flows through the exact same bilingual,
+full-nutrient-panel parser as local OCR (`parse_nutrition_text()`) — the
+engine is just a different way of getting text out of the photo.
+
+**A design choice worth explaining:** the person who requested this
+feature pointed at
+[huggingface.co/spaces/merterbak/Mistral-OCR](https://huggingface.co/spaces/merterbak/Mistral-OCR)
+as the "needs an API key" option. Reading that Space's source shows it's
+just a thin demo UI that takes a user's API key and calls Mistral's own
+official OCR endpoint. So this app calls that same official Mistral
+endpoint (`https://api.mistral.ai/v1/ocr`) **directly**, rather than
+routing through the community Space — your API key then goes straight to
+Mistral and never transits a third party's server, and doesn't depend on
+someone's demo Space staying online or unchanged.
+
+**Please read before relying on either:**
+- Neither integration could be exercised against the live services while
+  building this — this development environment's network access doesn't
+  extend to `huggingface.co`, `*.hf.space`, or `api.mistral.ai`. The
+  request-building and response-parsing code (`modules/cloud_ocr.py`) was
+  written directly from each service's own published source/docs and is
+  covered by unit tests against realistic mocked responses, but you
+  should test both against the real services once deployed, and treat
+  the code as a solid starting point rather than a guarantee — either
+  provider could change their interface without notice, since these are
+  third-party services this app doesn't control.
+- **Baidu Unlimited-OCR** runs on Hugging Face's shared "ZeroGPU" pool.
+  As an anonymous (non-logged-in) caller, expect queueing delays and
+  occasional unavailability at busy times — it's a free community demo,
+  not a service with an uptime guarantee. Its API is also a custom
+  streaming endpoint specific to that Space (not a standardized OCR API),
+  so it's inherently more fragile to upstream changes than a stable,
+  versioned commercial API.
+- **Mistral OCR** is a paid commercial API (check current pricing at
+  mistral.ai) — your key is billed by Mistral, not by this app.
+- **Privacy:** either cloud option sends your photo to that provider's
+  servers for processing. Local OCR is the only option where the photo
+  never leaves your own device/server. The app shows a note about this
+  whenever a cloud engine is selected.
+- The Mistral API key field is a password-masked, session-only input —
+  it's used for that one request and never written to disk, the
+  database, or session state that persists across a page reload.
+
+---
+
 ## OCR reliability on real camera photos
 
 Clean, flat scans OCR easily; real phone photos are a different problem —
@@ -290,20 +426,23 @@ qualified healthcare provider before making decisions based on this app.
 A few ideas that would meaningfully improve usability beyond the current
 scope:
 
+- **Barcode scanning UI.** `modules/food_database_api.py` already
+  includes `fetch_product_by_barcode()` for exact-match lookup — it just
+  isn't wired into the UI yet. Adding a barcode input (or decoding one
+  from the camera photo via a library like `pyzbar`) would make packaged-
+  food lookup even faster and more precise than a name search.
 - **Daily meal log & trends** — beyond one-off saved foods, log what was
   actually *eaten* with a timestamp, and chart cumulative insulin load
   and caloric balance over a day/week (the `foods` table could grow a
   companion `meal_log` table referencing it).
-- **Barcode scanning fallback** — for packaged foods, look up
-  Open Food Facts by barcode as a higher-accuracy alternative to OCR, and
-  auto-fill brand/category from the lookup.
 - **Per-user accounts** — the current database is single-user/local; a
   hosted DB (see the note above) plus simple auth would let each person
   have their own saved-food library.
 - **Personalized insulin sensitivity input** — let users with a known
   HOMA-IR or clinical insulin-sensitivity value scale the estimate.
-- **Multi-language OCR** — add `easyocr` or `tesseract` language packs for
-  non-English labels.
+- **Multi-language OCR** — Japanese is supported now; add more
+  `tesseract-ocr-<lang>` packages and matching field-name patterns for
+  other non-English labels (Korean, Chinese, Spanish, etc.).
 - **Offline PWA support** — cache the app shell so it's usable with a
   spotty connection while grocery shopping.
 - **Export/share results** — let users export a scan as PDF/image to
@@ -318,7 +457,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-85 unit tests cover:
+150 unit tests cover:
 - Unit conversions (kg↔lb, ft/in↔cm)
 - BMI, Deurenberg body-fat %, Mifflin-St Jeor BMR/TDEE (including
   known-value checks and edge cases: zero height, negative inputs,
@@ -330,12 +469,16 @@ pytest tests/ -v
 - Body-fat change projection for both surplus and deficit scenarios,
   plus the zero-weight guard
 - OCR regex parsing against clean, noisy, partial, decimal-comma, and
-  garbage/empty English text inputs
+  garbage/empty English text inputs, now including the **full extended
+  nutrient panel** (saturated/trans fat, cholesterol, sodium, added
+  sugars, vitamin D, calcium, iron, potassium) — including a bug caught
+  and fixed during testing where the "Added Sugars" pattern could
+  misread the *previous* line's "Total Sugars" value across a line break
 - **Japanese label parsing**: clean labels, OCR-inserted-whitespace
   tolerance, the 糖質+食物繊維 carbohydrate-breakdown fallback (and that a
-  direct 炭水化物 total correctly takes precedence over it), full-width
-  digit normalization, mixed English/Japanese labels, and the 蛋白質
-  kanji variant for protein
+  direct 炭水化物 total correctly takes precedence over it), the
+  食塩相当量→sodium(mg) conversion, full-width digit normalization, mixed
+  English/Japanese labels, and the 蛋白質 kanji variant for protein
 - **Image preprocessing**: EXIF orientation correction (including a
   round-trip through a real JPEG with an orientation tag), huge-image
   downscaling, small-image upscaling, Otsu binarization producing
@@ -344,10 +487,32 @@ pytest tests/ -v
 - Food database: save/retrieve/delete, required-name validation, search
   by name/category/brand/tags individually and combined (AND logic
   across filters, ANY-match within tags), result ordering and limits,
-  and autocomplete value lookups (including empty-database and
-  duplicate/whitespace-tag edge cases)
+  autocomplete value lookups, the full extended nutrient panel and
+  `source` field, and **schema migration** — a dedicated test builds a
+  database with the original pre-extended-nutrient schema, inserts a
+  row, runs `init_db()` against it, and confirms the old data survives
+  with the new columns defaulted correctly
+- **Open Food Facts integration**, entirely via mocked HTTP responses
+  shaped like real OFF API payloads (no live network dependency or
+  flakiness from a third-party service): preferring per-serving values
+  over per-100g when available, the gram→mg conversion for sodium/
+  cholesterol (including a precision bug caught and fixed where rounding
+  small gram values *before* the ×1000 conversion silently lost
+  precision), serving-size text parsing, category/brand cleanup,
+  malformed/missing-field responses, and network failures, timeouts,
+  HTTP errors, and malformed JSON all degrading to an empty result
+  rather than raising
+- **Cloud OCR engines** (Baidu Unlimited-OCR, Mistral OCR), via mocked
+  `gradio_client`/`requests` calls: correct request construction
+  (API name, payload shape, auth header), successful-response parsing for
+  both engines, missing-dependency and missing-API-key guards, and every
+  failure mode (network error, timeout, 401/429/500 HTTP errors,
+  malformed JSON, empty results) raising a clear `CloudOCRError` rather
+  than crashing — plus a test confirming a cloud engine's output flows
+  correctly into the same bilingual/full-nutrient parser used by local
+  OCR
 
-All 85 tests pass. The app was also smoke-tested end-to-end: launched
+All 150 tests pass. The app was also smoke-tested end-to-end: launched
 headlessly from multiple working directories, confirmed a clean HTTP 200
 boot with no runtime exceptions, and run through the full image → OCR →
 parse → predict pipeline using a clear synthetic label (7/7 fields),
@@ -363,6 +528,13 @@ so those fields fall back to a plain text input until at least one value
 exists to suggest — and each fallback mode uses a distinct widget key so
 the field can never crash from a session-state type mismatch as the
 option pool grows between reruns.
+
+The full app was additionally exercised with Streamlit's official
+`AppTest` framework (`streamlit.testing.v1`), which runs the real script
+and simulates widget interaction without needing a browser: confirmed a
+clean run with zero exceptions, drove the Open Food Facts search UI
+end-to-end, and verified the complete "type a name → click Save → row
+actually lands in SQLite with the correct fields" flow.
 
 ---
 

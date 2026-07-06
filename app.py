@@ -34,6 +34,7 @@ from modules.calculations import (
 )
 from modules.ocr_parser import (
     extract_nutrition_from_image,
+    parse_nutrition_text,
     ocr_backends_available,
     tesseract_japanese_available,
     ParsedNutrition,
@@ -50,6 +51,13 @@ from modules.database import (
     get_distinct_tags,
     count_foods,
 )
+from modules.food_database_api import search_open_food_facts, ExternalFoodResult
+from modules.cloud_ocr import (
+    CloudOCRError,
+    CLOUD_ENGINES,
+    run_baidu_unlimited_ocr,
+    run_mistral_ocr,
+)
 
 init_db()
 
@@ -65,7 +73,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Session state defaults for the editable nutrition table
+# Session state defaults for the editable nutrition tables. The "core"
+# fields are the macros used in the insulin/body-fat predictions; the
+# "extended" fields are the rest of a standard nutrition label (still
+# saved and searchable, just not part of the prediction math).
 DEFAULT_FIELDS = {
     "Serving Size (g)": 100.0,
     "Calories": 0.0,
@@ -76,12 +87,28 @@ DEFAULT_FIELDS = {
     "Total Fat (g)": 0.0,
 }
 
+EXTENDED_DEFAULT_FIELDS = {
+    "Saturated Fat (g)": 0.0,
+    "Trans Fat (g)": 0.0,
+    "Cholesterol (mg)": 0.0,
+    "Sodium (mg)": 0.0,
+    "Added Sugars (g)": 0.0,
+    "Vitamin D (mcg)": 0.0,
+    "Calcium (mg)": 0.0,
+    "Iron (mg)": 0.0,
+    "Potassium (mg)": 0.0,
+}
+
 if "nutrition_values" not in st.session_state:
     st.session_state.nutrition_values = dict(DEFAULT_FIELDS)
+if "extended_nutrition_values" not in st.session_state:
+    st.session_state.extended_nutrition_values = dict(EXTENDED_DEFAULT_FIELDS)
 if "raw_ocr_text" not in st.session_state:
     st.session_state.raw_ocr_text = ""
 if "ocr_fields_found" not in st.session_state:
     st.session_state.ocr_fields_found = None
+if "current_source" not in st.session_state:
+    st.session_state.current_source = "Manual/OCR"
 
 
 def _autocomplete_select(
@@ -150,7 +177,7 @@ def _autocomplete_multiselect(
 
 
 def _apply_parsed_to_session(parsed: ParsedNutrition) -> None:
-    mapping = {
+    core_mapping = {
         "Serving Size (g)": parsed.serving_size_g,
         "Calories": parsed.calories,
         "Total Carbs (g)": parsed.total_carbs_g,
@@ -159,9 +186,45 @@ def _apply_parsed_to_session(parsed: ParsedNutrition) -> None:
         "Protein (g)": parsed.protein_g,
         "Total Fat (g)": parsed.total_fat_g,
     }
-    for label, value in mapping.items():
+    extended_mapping = {
+        "Saturated Fat (g)": parsed.saturated_fat_g,
+        "Trans Fat (g)": parsed.trans_fat_g,
+        "Cholesterol (mg)": parsed.cholesterol_mg,
+        "Sodium (mg)": parsed.sodium_mg,
+        "Added Sugars (g)": parsed.added_sugars_g,
+        "Vitamin D (mcg)": parsed.vitamin_d_mcg,
+        "Calcium (mg)": parsed.calcium_mg,
+        "Iron (mg)": parsed.iron_mg,
+        "Potassium (mg)": parsed.potassium_mg,
+    }
+    for label, value in core_mapping.items():
         if value is not None:
             st.session_state.nutrition_values[label] = value
+    for label, value in extended_mapping.items():
+        if value is not None:
+            st.session_state.extended_nutrition_values[label] = value
+
+
+def _load_external_result_to_session(result: ExternalFoodResult) -> None:
+    """Populate both nutrition value tables from a public-database result
+    (Open Food Facts). Only the fields OFF actually provides are set;
+    everything else keeps its current value."""
+    st.session_state.nutrition_values = {
+        "Serving Size (g)": result.serving_size_g,
+        "Calories": result.calories,
+        "Total Carbs (g)": result.total_carbs_g,
+        "Dietary Fiber (g)": result.fiber_g,
+        "Sugars (g)": result.sugars_g,
+        "Protein (g)": result.protein_g,
+        "Total Fat (g)": result.total_fat_g,
+    }
+    st.session_state.extended_nutrition_values = dict(EXTENDED_DEFAULT_FIELDS)
+    st.session_state.extended_nutrition_values["Saturated Fat (g)"] = result.saturated_fat_g
+    st.session_state.extended_nutrition_values["Trans Fat (g)"] = result.trans_fat_g
+    st.session_state.extended_nutrition_values["Cholesterol (mg)"] = result.cholesterol_mg
+    st.session_state.extended_nutrition_values["Sodium (mg)"] = result.sodium_mg
+    st.session_state.raw_ocr_text = ""
+    st.session_state.current_source = result.source
 
 
 # --------------------------------------------------------------------------- #
@@ -280,7 +343,7 @@ with st.expander(
                 chosen = options_map[choice_label]
                 load_col, delete_col = st.columns([2, 1])
                 with load_col:
-                    if st.button("⬇️ Load into current scan", use_container_width=True):
+                    if st.button("⬇️ Load into current scan", width='stretch'):
                         st.session_state.nutrition_values = {
                             "Serving Size (g)": chosen.serving_size_g,
                             "Calories": chosen.calories,
@@ -290,7 +353,19 @@ with st.expander(
                             "Protein (g)": chosen.protein_g,
                             "Total Fat (g)": chosen.total_fat_g,
                         }
+                        st.session_state.extended_nutrition_values = {
+                            "Saturated Fat (g)": chosen.saturated_fat_g,
+                            "Trans Fat (g)": chosen.trans_fat_g,
+                            "Cholesterol (mg)": chosen.cholesterol_mg,
+                            "Sodium (mg)": chosen.sodium_mg,
+                            "Added Sugars (g)": chosen.added_sugars_g,
+                            "Vitamin D (mcg)": chosen.vitamin_d_mcg,
+                            "Calcium (mg)": chosen.calcium_mg,
+                            "Iron (mg)": chosen.iron_mg,
+                            "Potassium (mg)": chosen.potassium_mg,
+                        }
                         st.session_state.raw_ocr_text = ""
+                        st.session_state.current_source = chosen.source or "Manual/OCR"
                         st.success(
                             f"Loaded '{chosen.name}' — scroll down to review and see "
                             "predictions. (It's already saved, so the save form below "
@@ -299,11 +374,72 @@ with st.expander(
                         )
                         st.rerun()
                 with delete_col:
-                    if st.button("🗑️ Delete", use_container_width=True):
+                    if st.button("🗑️ Delete", width='stretch'):
                         from modules.database import delete_food
                         delete_food(chosen.id)
                         st.success(f"Deleted '{chosen.name}'.")
                         st.rerun()
+
+st.divider()
+
+# --------------------------------------------------------------------------- #
+# Search a public food database (Open Food Facts) — auto-fill without OCR
+# --------------------------------------------------------------------------- #
+
+with st.expander("🌐 Search a public food database (Open Food Facts)", expanded=False):
+    st.caption(
+        "Looks up branded products by name from "
+        "[Open Food Facts](https://world.openfoodfacts.org), a free, "
+        "community-maintained database — no photo needed. Since it's "
+        "crowd-sourced, double-check the values before relying on them, "
+        "same as with a scanned label."
+    )
+    off_query = st.text_input(
+        "Search by product name", key="off_search_query",
+        placeholder="e.g. Chobani Greek Yogurt",
+    )
+    if off_query and off_query.strip():
+        with st.spinner("Searching Open Food Facts..."):
+            off_results = search_open_food_facts(off_query, page_size=10)
+
+        if not off_results:
+            st.info(
+                "No matches found (or the request failed / no internet "
+                "connection). Try a different search term, or use the "
+                "camera/manual entry below."
+            )
+        else:
+            def _format_off_result(food: ExternalFoodResult) -> str:
+                bits = [food.name]
+                if food.brand:
+                    bits.append(f"({food.brand})")
+                return " ".join(bits)
+
+            off_options_map = {_format_off_result(f): f for f in off_results}
+            off_choice_label = st.selectbox(
+                f"{len(off_results)} match(es) — pick one to load",
+                options=list(off_options_map.keys()),
+                index=None,
+                placeholder="Select a product to load its nutrition facts...",
+                key="off_result_choice",
+            )
+            if off_choice_label:
+                off_chosen = off_options_map[off_choice_label]
+                st.caption(
+                    f"Per {off_chosen.serving_size_g:.0f}g — "
+                    f"{off_chosen.calories:.0f} kcal, "
+                    f"{off_chosen.protein_g:.1f}g protein, "
+                    f"{off_chosen.total_carbs_g:.1f}g carbs, "
+                    f"{off_chosen.total_fat_g:.1f}g fat"
+                )
+                if st.button("⬇️ Load into current scan", key="off_load_button"):
+                    _load_external_result_to_session(off_chosen)
+                    st.success(
+                        f"Loaded '{off_chosen.name}' from Open Food Facts — "
+                        "scroll down to review, correct anything that looks "
+                        "off, and see predictions."
+                    )
+                    st.rerun()
 
 st.divider()
 
@@ -317,8 +453,9 @@ st.caption("Supports English and Japanese (日本語) labels.")
 backends = ocr_backends_available()
 if not any(backends.values()):
     st.info(
-        "No OCR engine (pytesseract / easyocr) was detected in this "
-        "environment. You can still enter nutrition values manually below."
+        "No local OCR engine (pytesseract / easyocr) was detected in "
+        "this environment. You can still enter nutrition values "
+        "manually below, or try a cloud engine."
     )
 elif backends.get("pytesseract") and not tesseract_japanese_available():
     st.warning(
@@ -327,6 +464,43 @@ elif backends.get("pytesseract") and not tesseract_japanese_available():
         "correctly yet — English labels are unaffected. If you're "
         "deploying this app yourself, make sure `packages.txt` includes "
         "`tesseract-ocr-jpn` (see README)."
+    )
+
+engine_choice = st.selectbox(
+    "OCR engine",
+    options=["Local (Tesseract / EasyOCR) — free, private, offline"]
+    + [v["label"] for v in CLOUD_ENGINES.values()],
+    index=0,
+    help=(
+        "Local processing never leaves this device/server. Cloud engines "
+        "can help with blurry or steeply-angled photos a local engine "
+        "struggles with, but send your photo to a third-party service — "
+        "see the note that appears below when one is selected."
+    ),
+)
+
+engine_key = None
+for key, meta in CLOUD_ENGINES.items():
+    if meta["label"] == engine_choice:
+        engine_key = key
+        st.info(f"ℹ️ {meta['privacy_note']}")
+        break
+
+mistral_api_key = ""
+if engine_key == "mistral":
+    mistral_api_key = st.text_input(
+        "Mistral API key",
+        type="password",
+        placeholder="Paste your Mistral API key here",
+        help="Get one at https://console.mistral.ai/. Used only for this "
+             "request, never saved or sent anywhere else.",
+    )
+
+if engine_key == "baidu" and not CLOUD_ENGINES["baidu"]["available"]():
+    st.warning(
+        "The `gradio_client` package isn't installed, so this engine "
+        "isn't available right now. Add `gradio_client` to "
+        "requirements.txt, or choose a different engine."
     )
 
 tab_camera, tab_upload = st.tabs(["📷 Use Camera", "📁 Upload from Gallery"])
@@ -351,7 +525,7 @@ image_obj = None
 if captured_image is not None:
     try:
         image_obj = Image.open(captured_image)
-        st.image(image_obj, caption="Captured label", use_container_width=True)
+        st.image(image_obj, caption="Captured label", width='stretch')
     except UnidentifiedImageError:
         st.error(
             "That file couldn't be read as an image (it may be corrupted). "
@@ -361,28 +535,61 @@ if captured_image is not None:
         st.error(f"Unexpected error opening the image: {exc}. Please try again.")
 
     if image_obj is not None:
-        with st.spinner("Reading label with OCR..."):
+        spinner_label = {
+            None: "Reading label with local OCR...",
+            "baidu": "Reading label with Baidu Unlimited-OCR (cloud)...",
+            "mistral": "Reading label with Mistral OCR (cloud)...",
+        }[engine_key]
+
+        with st.spinner(spinner_label):
+            raw_text = ""
+            ocr_error = None
             try:
-                parsed, raw_text = extract_nutrition_from_image(image_obj)
-                st.session_state.raw_ocr_text = raw_text
-                st.session_state.ocr_fields_found = parsed.fields_found()
-                if parsed.is_empty():
-                    st.warning(
-                        "Couldn't confidently read any nutrition values from "
-                        "this image. Please enter them manually below."
-                    )
-                else:
-                    _apply_parsed_to_session(parsed)
-                    st.success(
-                        f"Extracted {parsed.fields_found()} of 7 fields. "
-                        "Please double-check the values below — OCR can "
-                        "misread labels, especially on blurry or angled photos."
-                    )
+                if engine_key is None:
+                    parsed, raw_text = extract_nutrition_from_image(image_obj)
+                elif engine_key == "baidu":
+                    raw_text = run_baidu_unlimited_ocr(image_obj)
+                    parsed = parse_nutrition_text(raw_text)
+                elif engine_key == "mistral":
+                    raw_text = run_mistral_ocr(image_obj, api_key=mistral_api_key)
+                    parsed = parse_nutrition_text(raw_text)
+            except CloudOCRError as exc:
+                ocr_error = str(exc)
+                parsed = None
             except Exception as exc:
-                st.error(
+                ocr_error = (
                     f"OCR processing failed ({exc}). Please enter the "
                     "nutrition values manually below."
                 )
+                parsed = None
+
+            if ocr_error:
+                st.error(ocr_error)
+            else:
+                st.session_state.raw_ocr_text = raw_text
+                st.session_state.ocr_fields_found = parsed.fields_found()
+                st.session_state.current_source = "Manual/OCR"
+                if parsed.is_empty():
+                    st.warning(
+                        "Couldn't confidently read any nutrition values from "
+                        "this image. Please enter them manually below, or "
+                        "try a different OCR engine above."
+                    )
+                else:
+                    _apply_parsed_to_session(parsed)
+                    core_found = sum(
+                        1 for f in [
+                            parsed.serving_size_g, parsed.calories, parsed.total_carbs_g,
+                            parsed.fiber_g, parsed.sugars_g, parsed.protein_g, parsed.total_fat_g,
+                        ] if f is not None
+                    )
+                    extra_found = parsed.fields_found() - core_found
+                    st.success(
+                        f"Extracted {core_found}/7 core fields"
+                        + (f" and {extra_found} additional nutrient(s)" if extra_found else "")
+                        + ". Please double-check the values below — OCR can "
+                        "misread labels, especially on blurry or angled photos."
+                    )
 
     if st.session_state.raw_ocr_text:
         with st.expander("🔍 View raw OCR text (for debugging misreads)"):
@@ -410,13 +617,40 @@ edited_df = st.data_editor(
         "Value": st.column_config.NumberColumn("Value", min_value=0.0, step=0.1, format="%.1f"),
     },
     hide_index=True,
-    use_container_width=True,
+    width='stretch',
     key="nutrition_editor",
 )
 
 # Sync edits back to session state
 for _, row in edited_df.iterrows():
     st.session_state.nutrition_values[row["Field"]] = float(row["Value"]) if pd.notna(row["Value"]) else 0.0
+
+with st.expander("➕ Additional nutrients (optional)"):
+    st.caption(
+        "Captured from the label when available (auto-filled by OCR or a "
+        "public database lookup); not used in the predictions below, but "
+        "saved and searchable like everything else."
+    )
+    extended_df = pd.DataFrame(
+        {
+            "Field": list(st.session_state.extended_nutrition_values.keys()),
+            "Value": list(st.session_state.extended_nutrition_values.values()),
+        }
+    )
+    edited_extended_df = st.data_editor(
+        extended_df,
+        column_config={
+            "Field": st.column_config.TextColumn("Nutrition Field", disabled=True),
+            "Value": st.column_config.NumberColumn("Value", min_value=0.0, step=0.1, format="%.2f"),
+        },
+        hide_index=True,
+        width='stretch',
+        key="extended_nutrition_editor",
+    )
+    for _, row in edited_extended_df.iterrows():
+        st.session_state.extended_nutrition_values[row["Field"]] = (
+            float(row["Value"]) if pd.notna(row["Value"]) else 0.0
+        )
 
 servings_consumed = st.number_input(
     "How many servings do you plan to eat?",
@@ -427,7 +661,9 @@ reset_col, _ = st.columns([1, 3])
 with reset_col:
     if st.button("↺ Reset values"):
         st.session_state.nutrition_values = dict(DEFAULT_FIELDS)
+        st.session_state.extended_nutrition_values = dict(EXTENDED_DEFAULT_FIELDS)
         st.session_state.raw_ocr_text = ""
+        st.session_state.current_source = "Manual/OCR"
         st.rerun()
 
 
@@ -441,6 +677,8 @@ st.caption(
     "Give it a name and any tags so you can find and reload it later "
     "without rescanning."
 )
+if st.session_state.current_source != "Manual/OCR":
+    st.caption(f"📥 Nutrition data source: **{st.session_state.current_source}**")
 
 save_col1, save_col2 = st.columns(2)
 with save_col1:
@@ -464,6 +702,7 @@ with save_col2:
 
 if st.button("💾 Save this food", type="primary"):
     v = st.session_state.nutrition_values
+    ev = st.session_state.extended_nutrition_values
     if not food_name_input or not str(food_name_input).strip():
         st.error("Please enter a food name before saving.")
     else:
@@ -481,6 +720,16 @@ if st.button("💾 Save this food", type="primary"):
                     sugars_g=v["Sugars (g)"],
                     protein_g=v["Protein (g)"],
                     total_fat_g=v["Total Fat (g)"],
+                    saturated_fat_g=ev["Saturated Fat (g)"],
+                    trans_fat_g=ev["Trans Fat (g)"],
+                    cholesterol_mg=ev["Cholesterol (mg)"],
+                    sodium_mg=ev["Sodium (mg)"],
+                    added_sugars_g=ev["Added Sugars (g)"],
+                    vitamin_d_mcg=ev["Vitamin D (mcg)"],
+                    calcium_mg=ev["Calcium (mg)"],
+                    iron_mg=ev["Iron (mg)"],
+                    potassium_mg=ev["Potassium (mg)"],
+                    source=st.session_state.current_source,
                 )
             )
             st.success(f"Saved '{food_name_input}' to your food database (#{new_id}).")
@@ -495,6 +744,7 @@ if st.button("💾 Save this food", type="primary"):
 # --------------------------------------------------------------------------- #
 
 vals = st.session_state.nutrition_values
+extended_vals = st.session_state.extended_nutrition_values
 facts = NutritionFacts(
     serving_size_g=vals["Serving Size (g)"] or 100.0,
     servings_consumed=servings_consumed,
@@ -504,6 +754,15 @@ facts = NutritionFacts(
     sugars_g=vals["Sugars (g)"],
     protein_g=vals["Protein (g)"],
     total_fat_g=vals["Total Fat (g)"],
+    saturated_fat_g=extended_vals["Saturated Fat (g)"],
+    trans_fat_g=extended_vals["Trans Fat (g)"],
+    cholesterol_mg=extended_vals["Cholesterol (mg)"],
+    sodium_mg=extended_vals["Sodium (mg)"],
+    added_sugars_g=extended_vals["Added Sugars (g)"],
+    vitamin_d_mcg=extended_vals["Vitamin D (mcg)"],
+    calcium_mg=extended_vals["Calcium (mg)"],
+    iron_mg=extended_vals["Iron (mg)"],
+    potassium_mg=extended_vals["Potassium (mg)"],
 )
 
 has_any_data = any(
@@ -518,6 +777,30 @@ if not has_any_data:
     st.stop()
 
 scaled_facts = facts.scaled()
+
+with st.expander("📋 Full nutrition panel (scaled to servings entered above)"):
+    panel_rows = [
+        ("Serving Size", f"{scaled_facts.serving_size_g:.0f} g"),
+        ("Calories", f"{scaled_facts.calories:.0f} kcal"),
+        ("Total Fat", f"{scaled_facts.total_fat_g:.1f} g"),
+        ("  Saturated Fat", f"{scaled_facts.saturated_fat_g:.1f} g"),
+        ("  Trans Fat", f"{scaled_facts.trans_fat_g:.1f} g"),
+        ("Cholesterol", f"{scaled_facts.cholesterol_mg:.1f} mg"),
+        ("Sodium", f"{scaled_facts.sodium_mg:.1f} mg"),
+        ("Total Carbohydrate", f"{scaled_facts.total_carbs_g:.1f} g"),
+        ("  Dietary Fiber", f"{scaled_facts.fiber_g:.1f} g"),
+        ("  Total Sugars", f"{scaled_facts.sugars_g:.1f} g"),
+        ("    Added Sugars", f"{scaled_facts.added_sugars_g:.1f} g"),
+        ("Protein", f"{scaled_facts.protein_g:.1f} g"),
+        ("Vitamin D", f"{scaled_facts.vitamin_d_mcg:.1f} mcg"),
+        ("Calcium", f"{scaled_facts.calcium_mg:.1f} mg"),
+        ("Iron", f"{scaled_facts.iron_mg:.1f} mg"),
+        ("Potassium", f"{scaled_facts.potassium_mg:.1f} mg"),
+    ]
+    st.dataframe(
+        pd.DataFrame(panel_rows, columns=["Nutrient", "Amount"]),
+        hide_index=True, width='stretch',
+    )
 
 # --------------------------------------------------------------------------- #
 # Insulin prediction

@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -270,3 +271,113 @@ def test_food_entry_tags_display():
 def test_food_entry_tags_display_empty():
     entry = make_entry(tags=[])
     assert entry.tags_display() == ""
+
+
+# --------------------------------------------------------------------------- #
+# Extended nutrient panel
+# --------------------------------------------------------------------------- #
+
+def test_save_and_retrieve_extended_nutrients(db_path):
+    entry = make_entry(
+        saturated_fat_g=2.5, trans_fat_g=0.0, cholesterol_mg=15.0,
+        sodium_mg=140.0, added_sugars_g=3.0, vitamin_d_mcg=1.2,
+        calcium_mg=200.0, iron_mg=0.8, potassium_mg=300.0,
+        source="Manual/OCR",
+    )
+    food_id = save_food(entry, db_path)
+    fetched = get_food_by_id(food_id, db_path)
+    assert fetched.saturated_fat_g == 2.5
+    assert fetched.cholesterol_mg == 15.0
+    assert fetched.sodium_mg == 140.0
+    assert fetched.added_sugars_g == 3.0
+    assert fetched.vitamin_d_mcg == 1.2
+    assert fetched.calcium_mg == 200.0
+    assert fetched.iron_mg == 0.8
+    assert fetched.potassium_mg == 300.0
+    assert fetched.source == "Manual/OCR"
+
+
+def test_extended_nutrients_default_to_zero_when_unspecified(db_path):
+    entry = make_entry()  # no extended fields passed
+    food_id = save_food(entry, db_path)
+    fetched = get_food_by_id(food_id, db_path)
+    assert fetched.saturated_fat_g == 0.0
+    assert fetched.sodium_mg == 0.0
+    assert fetched.potassium_mg == 0.0
+
+
+def test_source_field_optional(db_path):
+    entry = make_entry(source=None)
+    food_id = save_food(entry, db_path)
+    fetched = get_food_by_id(food_id, db_path)
+    assert fetched.source is None
+
+
+def test_source_field_from_open_food_facts(db_path):
+    entry = make_entry(source="Open Food Facts")
+    food_id = save_food(entry, db_path)
+    fetched = get_food_by_id(food_id, db_path)
+    assert fetched.source == "Open Food Facts"
+
+
+# --------------------------------------------------------------------------- #
+# Schema migration (backward compatibility with pre-extended-nutrient DBs)
+# --------------------------------------------------------------------------- #
+
+def test_migration_adds_missing_columns_to_old_schema(tmp_path):
+    """Simulate a database created by an older version of the app (only
+    the original 7-macro schema, no extended nutrient columns or
+    `source`), and verify init_db() migrates it in-place without losing
+    existing data."""
+    path = str(tmp_path / "old_schema.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE foods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            category TEXT,
+            brand TEXT,
+            tags TEXT,
+            serving_size_g REAL,
+            calories REAL,
+            total_carbs_g REAL,
+            fiber_g REAL,
+            sugars_g REAL,
+            protein_g REAL,
+            total_fat_g REAL,
+            created_at TEXT NOT NULL
+        );
+    """)
+    conn.execute(
+        "INSERT INTO foods (name, category, brand, tags, serving_size_g, "
+        "calories, total_carbs_g, fiber_g, sugars_g, protein_g, total_fat_g, "
+        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("Old Food", "Snack", "BrandX", "tag1", 100, 200, 30, 2, 5, 4, 8, "2024-01-01"),
+    )
+    conn.commit()
+    conn.close()
+
+    # Now run init_db (as the app would on startup) to migrate the schema
+    init_db(path)
+
+    # Old data should survive, and new columns should exist with defaults
+    results = search_foods(db_path=path)
+    assert len(results) == 1
+    old_food = results[0]
+    assert old_food.name == "Old Food"
+    assert old_food.calories == 200
+    assert old_food.saturated_fat_g == 0.0
+    assert old_food.sodium_mg == 0.0
+    assert old_food.source is None
+
+    # And saving a brand-new entry with extended fields should work fine
+    new_id = save_food(make_entry(name="New Food", sodium_mg=99.0), path)
+    new_food = get_food_by_id(new_id, path)
+    assert new_food.sodium_mg == 99.0
+
+
+def test_migration_is_idempotent(db_path):
+    # Calling init_db() again on an already-current schema should not error
+    init_db(db_path)
+    init_db(db_path)
+    assert count_foods(db_path) == 0

@@ -63,6 +63,18 @@ class ParsedNutrition:
     protein_g: Optional[float] = None
     total_fat_g: Optional[float] = None
 
+    # Extended nutrient panel -- same "not used in predictions, but
+    # captured because it's on the label" rationale as NutritionFacts.
+    saturated_fat_g: Optional[float] = None
+    trans_fat_g: Optional[float] = None
+    cholesterol_mg: Optional[float] = None
+    sodium_mg: Optional[float] = None
+    added_sugars_g: Optional[float] = None
+    vitamin_d_mcg: Optional[float] = None
+    calcium_mg: Optional[float] = None
+    iron_mg: Optional[float] = None
+    potassium_mg: Optional[float] = None
+
     def fields_found(self) -> int:
         return sum(1 for f in fields(self) if getattr(self, f.name) is not None)
 
@@ -331,7 +343,70 @@ _FIELD_PATTERNS = {
         # Japanese: "脂質 6g"
         rf"{_jp('脂質')}[^0-9]{{0,10}}{_NUMBER}\s*g",
     ],
+    "saturated_fat_g": [
+        rf"saturated\s*fat[^0-9]{{0,10}}{_NUMBER}\s*g",
+        # Japanese: "飽和脂肪酸 2g"
+        rf"{_jp('飽和脂肪酸')}[^0-9]{{0,10}}{_NUMBER}\s*g",
+    ],
+    "trans_fat_g": [
+        rf"trans\s*fat[^0-9]{{0,10}}{_NUMBER}\s*g",
+        # Japanese: "トランス脂肪酸 0g"
+        rf"{_jp('トランス脂肪酸')}[^0-9]{{0,10}}{_NUMBER}\s*g",
+    ],
+    "cholesterol_mg": [
+        rf"cholesterol[^0-9]{{0,10}}{_NUMBER}\s*mg",
+        # Japanese: "コレステロール 5mg"
+        rf"{_jp('コレステロール')}[^0-9]{{0,10}}{_NUMBER}\s*mg",
+    ],
+    "sodium_mg": [
+        rf"sodium[^0-9]{{0,10}}{_NUMBER}\s*mg",
+        # Japanese labels sometimes show sodium directly as ナトリウム,
+        # though 食塩相当量 (salt equivalent) is far more common -- that's
+        # handled as a gram-based fallback conversion below, since it's a
+        # different unit/quantity (salt, not sodium) and needs converting.
+        rf"{_jp('ナトリウム')}[^0-9]{{0,10}}{_NUMBER}\s*mg",
+    ],
+    "added_sugars_g": [
+        # Most common OCR'd order: "Added Sugars 3g"
+        rf"added\s*sugars[^0-9]{{0,10}}{_NUMBER}\s*g",
+        # FDA sub-line format: "Includes 3g Added Sugars". 'includes' is
+        # required (not optional) here -- without it, this pattern would
+        # match across a line break and grab the number from an unrelated
+        # preceding line (e.g. "Total Sugars 9g\nAdded Sugars 3g" could
+        # otherwise misread the 9 as the added-sugars value, since \s*
+        # matches newlines too).
+        rf"includes\s*{_NUMBER}\s*g\s*added\s*sugars",
+    ],
+    "vitamin_d_mcg": [
+        rf"vitamin\s*d[^0-9]{{0,10}}{_NUMBER}\s*(?:mcg|µg|μg|ug)",
+        # Japanese: "ビタミンD 2.0μg"
+        rf"{_jp('ビタミンd')}[^0-9]{{0,10}}{_NUMBER}\s*(?:mcg|µg|μg|ug)",
+    ],
+    "calcium_mg": [
+        rf"calcium[^0-9]{{0,10}}{_NUMBER}\s*mg",
+        # Japanese: "カルシウム 68mg"
+        rf"{_jp('カルシウム')}[^0-9]{{0,10}}{_NUMBER}\s*mg",
+    ],
+    "iron_mg": [
+        rf"iron[^0-9]{{0,10}}{_NUMBER}\s*mg",
+        # Japanese: "鉄 0.1mg"
+        rf"{_jp('鉄')}[^0-9]{{0,10}}{_NUMBER}\s*mg",
+    ],
+    "potassium_mg": [
+        rf"potassium[^0-9]{{0,10}}{_NUMBER}\s*mg",
+        # Japanese: "カリウム 150mg"
+        rf"{_jp('カリウム')}[^0-9]{{0,10}}{_NUMBER}\s*mg",
+    ],
 }
+
+# Japanese nutrition labels report sodium as 食塩相当量 ("salt equivalent",
+# in grams) rather than sodium in mg. When no direct sodium_mg match was
+# found, this pattern captures the salt-equivalent value so it can be
+# converted: sodium(mg) = salt(g) / 2.54 * 1000. The 2.54 factor is the
+# standard NaCl<->sodium conversion used on Japanese labels (salt = sodium
+# x 2.54).
+_SALT_EQUIVALENT_PATTERN = rf"{_jp('食塩相当量')}[^0-9]{{0,10}}{_NUMBER}\s*g"
+_SALT_TO_SODIUM_FACTOR = 2.54
 
 # Some Japanese labels break "carbohydrate" into two separate lines --
 # 糖質 (carbs excluding fiber) and 食物繊維 (fiber) -- instead of printing
@@ -378,6 +453,18 @@ def parse_nutrition_text(text: str) -> ParsedNutrition:
             try:
                 carbs_ex_fiber = _clean_number(match.group(1))
                 result.total_carbs_g = round(carbs_ex_fiber + (result.fiber_g or 0.0), 1)
+            except (ValueError, IndexError):
+                pass
+
+    # Fallback: Japanese labels report 食塩相当量 (salt equivalent, in
+    # grams) instead of sodium in mg. Convert it when no direct sodium
+    # value was already found.
+    if result.sodium_mg is None:
+        match = re.search(_SALT_EQUIVALENT_PATTERN, normalized, flags=re.IGNORECASE | re.MULTILINE)
+        if match:
+            try:
+                salt_g = _clean_number(match.group(1))
+                result.sodium_mg = round(salt_g / _SALT_TO_SODIUM_FACTOR * 1000, 1)
             except (ValueError, IndexError):
                 pass
 

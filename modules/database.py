@@ -25,7 +25,23 @@ Schema (table `foods`):
     sugars_g       REAL
     protein_g      REAL
     total_fat_g    REAL
+    saturated_fat_g REAL
+    trans_fat_g     REAL
+    cholesterol_mg  REAL
+    sodium_mg       REAL
+    added_sugars_g  REAL
+    vitamin_d_mcg   REAL
+    calcium_mg      REAL
+    iron_mg         REAL
+    potassium_mg    REAL
+    source          TEXT                 -- e.g. "Open Food Facts", "Manual/OCR"
     created_at     TEXT                 -- ISO 8601 timestamp
+
+The extended nutrient columns (saturated_fat_g through potassium_mg) were
+added after the initial release. `init_db()` runs a lightweight migration
+on every startup that adds any missing columns to an existing database
+file via `ALTER TABLE`, so upgrading the app doesn't break a database
+someone already has on disk from an earlier version.
 
 NOTE ON DEPLOYMENT: on Streamlit Community Cloud, the filesystem is
 ephemeral — the database resets whenever the app restarts or redeploys.
@@ -66,12 +82,37 @@ CREATE TABLE IF NOT EXISTS foods (
     sugars_g REAL,
     protein_g REAL,
     total_fat_g REAL,
+    saturated_fat_g REAL,
+    trans_fat_g REAL,
+    cholesterol_mg REAL,
+    sodium_mg REAL,
+    added_sugars_g REAL,
+    vitamin_d_mcg REAL,
+    calcium_mg REAL,
+    iron_mg REAL,
+    potassium_mg REAL,
+    source TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_foods_name ON foods(name);
 CREATE INDEX IF NOT EXISTS idx_foods_category ON foods(category);
 CREATE INDEX IF NOT EXISTS idx_foods_brand ON foods(brand);
 """
+
+# Columns added after the initial release. Used by `_migrate_schema` to
+# bring an older database file up to date without losing existing data.
+_MIGRATION_COLUMNS = {
+    "saturated_fat_g": "REAL DEFAULT 0",
+    "trans_fat_g": "REAL DEFAULT 0",
+    "cholesterol_mg": "REAL DEFAULT 0",
+    "sodium_mg": "REAL DEFAULT 0",
+    "added_sugars_g": "REAL DEFAULT 0",
+    "vitamin_d_mcg": "REAL DEFAULT 0",
+    "calcium_mg": "REAL DEFAULT 0",
+    "iron_mg": "REAL DEFAULT 0",
+    "potassium_mg": "REAL DEFAULT 0",
+    "source": "TEXT",
+}
 
 
 @dataclass
@@ -89,6 +130,21 @@ class FoodEntry:
     sugars_g: float = 0.0
     protein_g: float = 0.0
     total_fat_g: float = 0.0
+
+    # Extended nutrient panel (same rationale as calculations.NutritionFacts
+    # and ocr_parser.ParsedNutrition -- captured because it's on the
+    # label, even though predictions only use the macros above).
+    saturated_fat_g: float = 0.0
+    trans_fat_g: float = 0.0
+    cholesterol_mg: float = 0.0
+    sodium_mg: float = 0.0
+    added_sugars_g: float = 0.0
+    vitamin_d_mcg: float = 0.0
+    calcium_mg: float = 0.0
+    iron_mg: float = 0.0
+    potassium_mg: float = 0.0
+
+    source: Optional[str] = None  # e.g. "Open Food Facts", "Manual/OCR"
     id: Optional[int] = None
     created_at: Optional[str] = None
 
@@ -108,14 +164,30 @@ def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
 
 
 def init_db(db_path: str = DB_PATH) -> None:
-    """Create the foods table (and indexes) if they don't already exist.
-    Safe to call on every app startup."""
+    """Create the foods table (and indexes) if they don't already exist,
+    then migrate any missing columns into an existing table. Safe to call
+    on every app startup."""
     conn = _connect(db_path)
     try:
         conn.executescript(_SCHEMA)
         conn.commit()
+        _migrate_schema(conn)
     finally:
         conn.close()
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add any columns introduced after the initial release to an
+    existing database file, so upgrading the app doesn't crash or lose
+    data for someone who already has a `foods` table on disk from an
+    older version without the extended nutrient columns."""
+    existing_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(foods)").fetchall()
+    }
+    for column, column_type in _MIGRATION_COLUMNS.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE foods ADD COLUMN {column} {column_type}")
+    conn.commit()
 
 
 def _tags_to_str(tags: list) -> str:
@@ -130,19 +202,37 @@ def _tags_from_str(raw: Optional[str]) -> list:
 
 
 def _row_to_entry(row: sqlite3.Row) -> FoodEntry:
+    # Use .get()-style access via row.keys() so this stays safe even if
+    # called against a row from a not-yet-migrated older schema (defensive;
+    # init_db() always migrates first in normal operation).
+    available = row.keys()
+
+    def get(col: str, default: float = 0.0) -> float:
+        return (row[col] if col in available else None) or default
+
     return FoodEntry(
         id=row["id"],
         name=row["name"],
         category=row["category"],
         brand=row["brand"],
         tags=_tags_from_str(row["tags"]),
-        serving_size_g=row["serving_size_g"] or 0.0,
-        calories=row["calories"] or 0.0,
-        total_carbs_g=row["total_carbs_g"] or 0.0,
-        fiber_g=row["fiber_g"] or 0.0,
-        sugars_g=row["sugars_g"] or 0.0,
-        protein_g=row["protein_g"] or 0.0,
-        total_fat_g=row["total_fat_g"] or 0.0,
+        serving_size_g=get("serving_size_g"),
+        calories=get("calories"),
+        total_carbs_g=get("total_carbs_g"),
+        fiber_g=get("fiber_g"),
+        sugars_g=get("sugars_g"),
+        protein_g=get("protein_g"),
+        total_fat_g=get("total_fat_g"),
+        saturated_fat_g=get("saturated_fat_g"),
+        trans_fat_g=get("trans_fat_g"),
+        cholesterol_mg=get("cholesterol_mg"),
+        sodium_mg=get("sodium_mg"),
+        added_sugars_g=get("added_sugars_g"),
+        vitamin_d_mcg=get("vitamin_d_mcg"),
+        calcium_mg=get("calcium_mg"),
+        iron_mg=get("iron_mg"),
+        potassium_mg=get("potassium_mg"),
+        source=row["source"] if "source" in available else None,
         created_at=row["created_at"],
     )
 
@@ -167,8 +257,10 @@ def save_food(entry: FoodEntry, db_path: str = DB_PATH) -> int:
             INSERT INTO foods (
                 name, category, brand, tags, serving_size_g, calories,
                 total_carbs_g, fiber_g, sugars_g, protein_g, total_fat_g,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                saturated_fat_g, trans_fat_g, cholesterol_mg, sodium_mg,
+                added_sugars_g, vitamin_d_mcg, calcium_mg, iron_mg,
+                potassium_mg, source, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry.name.strip(),
@@ -182,6 +274,16 @@ def save_food(entry: FoodEntry, db_path: str = DB_PATH) -> int:
                 entry.sugars_g,
                 entry.protein_g,
                 entry.total_fat_g,
+                entry.saturated_fat_g,
+                entry.trans_fat_g,
+                entry.cholesterol_mg,
+                entry.sodium_mg,
+                entry.added_sugars_g,
+                entry.vitamin_d_mcg,
+                entry.calcium_mg,
+                entry.iron_mg,
+                entry.potassium_mg,
+                (entry.source or "").strip() or None,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )

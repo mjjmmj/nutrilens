@@ -166,6 +166,20 @@ class NutritionFacts:
     protein_g: float = 0.0
     total_fat_g: float = 0.0
 
+    # Extended nutrient panel (not used in the insulin/body-fat prediction
+    # math below, which only needs the macros above, but captured and
+    # stored because a nutrition label is more than its macros). Fields
+    # and units follow the standard FDA "Nutrition Facts" panel.
+    saturated_fat_g: float = 0.0
+    trans_fat_g: float = 0.0
+    cholesterol_mg: float = 0.0
+    sodium_mg: float = 0.0
+    added_sugars_g: float = 0.0
+    vitamin_d_mcg: float = 0.0
+    calcium_mg: float = 0.0
+    iron_mg: float = 0.0
+    potassium_mg: float = 0.0
+
     def scaled(self) -> "NutritionFacts":
         """Return a copy scaled by the number of servings the user intends
         to eat."""
@@ -179,6 +193,15 @@ class NutritionFacts:
             sugars_g=self.sugars_g * m,
             protein_g=self.protein_g * m,
             total_fat_g=self.total_fat_g * m,
+            saturated_fat_g=self.saturated_fat_g * m,
+            trans_fat_g=self.trans_fat_g * m,
+            cholesterol_mg=self.cholesterol_mg * m,
+            sodium_mg=self.sodium_mg * m,
+            added_sugars_g=self.added_sugars_g * m,
+            vitamin_d_mcg=self.vitamin_d_mcg * m,
+            calcium_mg=self.calcium_mg * m,
+            iron_mg=self.iron_mg * m,
+            potassium_mg=self.potassium_mg * m,
         )
 
 
