@@ -268,6 +268,30 @@ key required — by product name, and loads a match's full nutrition data
 is the fastest path for common packaged foods and doesn't need a photo
 at all.
 
+**✅ Highlighting auto-filled values.** Every value pulled in automatically
+— by local OCR, a cloud OCR engine, or an Open Food Facts lookup — is
+marked with a "✅ Auto-filled" tag in a *Source* column on both editable
+tables, distinct from "✏️ Manual" for anything left at its default or
+typed in by hand. This makes it obvious at a glance which numbers came
+from the scan/lookup and deserve a closer look, versus which ones are
+just a zero placeholder waiting to be filled in. If you edit an
+auto-filled value yourself, it correctly switches to "✏️ Manual" — the
+highlight only ever reflects what the *last* scan/lookup actually found,
+not what's merely still sitting in the field.
+
+**A Streamlit quirk worth knowing about (fixed):** editing a cell in
+either table used to sometimes require typing a value twice before it
+"stuck" — the first edit would visually revert, and only the second
+identical edit would actually register. The cause: both tables are
+reconstructed fresh from session state on every rerun *and* given a
+fixed widget key, and Streamlit's `data_editor` can momentarily conflict
+between its own internally-tracked edit and that freshly-passed data on
+the very rerun the edit happens. The fix versions each table's key,
+bumping it only at the exact moments this app intentionally overwrites
+the values from outside (a new OCR scan, an Open Food Facts/saved-food
+load, or Reset) — so a normal edit reliably registers on the first try,
+while a programmatic update still cleanly replaces what's shown.
+
 A few implementation notes:
 - OFF reports nutrients per 100g and, when available, per serving; the
   per-serving values are preferred when present (`modules/food_database_api.py`),
@@ -282,11 +306,99 @@ A few implementation notes:
 - Every food record also stores where its data came from
   (`source`: "Open Food Facts" or "Manual/OCR"), shown next to the save
   form when it isn't your own manual entry.
-- All network calls are wrapped in try/except and return an empty
-  result on any failure (no internet, timeout, product not found) —
-  the app falls back to a friendly "no matches" message rather than
-  crashing, and the search/parsing logic is fully unit tested against
-  mocked HTTP responses so it doesn't depend on OFF's live uptime.
+- **Transport & rate limits (important):** Open Food Facts' own API docs
+  state plainly that full-text product search has no v2/v3 REST
+  replacement yet — `/cgi/search.pl` (what this app's official
+  `openfoodfacts` SDK calls internally) remains the documented,
+  currently-intended way to do it. That endpoint is explicitly
+  rate-limited to **10 requests/minute/IP**, with a shared global
+  capacity cap on top — Open Food Facts' docs state a **HTTP 503 is the
+  expected response when either limit is exceeded**, and explicitly warn
+  integrators not to use it for search-as-you-type. An earlier version of
+  this app did exactly that by accident: it re-ran the search on *every*
+  script rerun as long as the search box was non-empty, and Streamlit
+  reruns the whole script on *any* widget interaction anywhere on the
+  page — so editing an unrelated nutrition cell, changing servings, or
+  switching OCR engines silently re-fired the same Open Food Facts search
+  every time, right into that rate limit. Two fixes address this:
+  1. **An explicit "🔍 Search" button**, with the last-searched query and
+     its results cached in session state — a search only actually calls
+     Open Food Facts when the term is new, not on every unrelated rerun.
+  2. **Automatic retry with a short backoff on 429/503** specifically
+     (not on other errors), since Open Food Facts' own docs frame those
+     two as transient/rate-limit conditions worth a brief retry rather
+     than failing immediately.
+- **Error handling:** a genuinely empty search ("no products matched")
+  and an actual failure (rate limit, timeout, server outage, no
+  internet) are deliberately kept distinct — the app raises a specific
+  `OpenFoodFactsError` for real failures with a message that says what
+  went wrong (e.g. "rate limit reached, try again shortly"), rather than
+  collapsing every failure mode into the same unhelpful "no matches
+  found" message. All of this — including the retry behavior and the
+  "don't re-search on an unrelated rerun" caching — is unit/integration
+  tested (the latter via Streamlit's `AppTest`, driving the actual search
+  button and a separate widget to confirm the call count doesn't
+  increase) so it doesn't depend on Open Food Facts' live uptime to verify.
+
+---
+
+## Future-proofing the third-party integrations
+
+Three integrations in this app — Open Food Facts, Baidu Unlimited-OCR,
+and Mistral OCR — depend on services this app doesn't control, each with
+its own history of interface changes (Open Food Facts' search backend
+migration is a real example that broke an earlier version of this app;
+see above). Rather than hardcoding one exact response shape and hoping it
+never changes, each integration has layered fallbacks so a future API
+change degrades gracefully instead of breaking outright. Full details are
+in each module's own "MAINTENANCE" docstring, but in summary:
+
+**`modules/food_database_api.py` (Open Food Facts):**
+- If a future SDK version renames/removes `api.product.text_search` or
+  `api.product.get`, the module catches that and falls back to a raw
+  REST call against the same endpoints the SDK uses internally.
+- If Open Food Facts' response shape changes (e.g. `"products"` becomes
+  `"hits"` as part of the ongoing search backend migration), a small
+  list of plausible key names is tried rather than assuming one forever.
+- Each nutrient field is looked up via a list of plausible key spellings
+  (`_NUTRIENT_KEY_ALIASES`) — if Open Food Facts renames a nutrient key,
+  add the new spelling to that list rather than changing extraction logic.
+- `check_sdk_compatibility()` does a soft, non-blocking version check and
+  surfaces a note in the UI if the installed SDK looks meaningfully
+  outside the tested range — informational only, never blocks the feature.
+
+**`modules/cloud_ocr.py` (Baidu Unlimited-OCR):**
+- Tries the currently-known API call shape first
+  (`api_name="/run_ocr"`, specific parameter names).
+- If that fails for any reason, it automatically asks the Space itself
+  what endpoints currently exist (`client.view_api()`) and matches
+  parameters *by label* (looking for words like "image"/"mode"/"prompt"
+  rather than exact names) instead of assuming a fixed signature. Only if
+  both attempts fail does it raise an error — and that error names both
+  attempts and links to the Space's live API page.
+- Once a strategy is confirmed working, it's remembered for the rest of
+  the process so later calls don't repeat an already-failed attempt.
+- Response parsing checks a few plausible key names (`text`, `output`,
+  `result`, `markdown`, `content`) rather than only one.
+
+**`modules/cloud_ocr.py` (Mistral OCR):**
+- Maintains an ordered list of model IDs to try (`_MISTRAL_MODEL_CANDIDATES`).
+  If the primary model is rejected as unknown/unavailable (distinguished
+  from other 400-class errors like a malformed request), it automatically
+  retries with the next candidate, and remembers whichever one worked.
+- Response parsing checks a couple of plausible alternate schemas in
+  case Mistral changes their response shape.
+
+**What "future-proof" does and doesn't mean here:** these mechanisms
+handle the most common, realistic classes of change (renamed methods,
+renamed response keys, renamed model IDs, minor parameter changes) without
+a code update. They can't anticipate a truly complete API redesign — if
+that happens, the MAINTENANCE notes in each module point at exactly what
+to look at first. All of this is unit-tested by deliberately simulating
+"the API changed" scenarios (missing methods, alternate response keys,
+rejected model IDs, renamed endpoints) and confirming the fallback
+actually engages and still produces a correct result — not just tested
+against the currently-expected shape.
 
 ---
 
@@ -457,7 +569,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-150 unit tests cover:
+206 unit tests cover:
 - Unit conversions (kg↔lb, ft/in↔cm)
 - BMI, Deurenberg body-fat %, Mifflin-St Jeor BMR/TDEE (including
   known-value checks and edge cases: zero height, negative inputs,
@@ -492,16 +604,23 @@ pytest tests/ -v
   database with the original pre-extended-nutrient schema, inserts a
   row, runs `init_db()` against it, and confirms the old data survives
   with the new columns defaulted correctly
-- **Open Food Facts integration**, entirely via mocked HTTP responses
-  shaped like real OFF API payloads (no live network dependency or
-  flakiness from a third-party service): preferring per-serving values
-  over per-100g when available, the gram→mg conversion for sodium/
-  cholesterol (including a precision bug caught and fixed where rounding
-  small gram values *before* the ×1000 conversion silently lost
-  precision), serving-size text parsing, category/brand cleanup,
-  malformed/missing-field responses, and network failures, timeouts,
-  HTTP errors, and malformed JSON all degrading to an empty result
-  rather than raising
+- **Open Food Facts integration**, mocking the official SDK's `API`
+  object directly (no live network dependency or flakiness from a
+  third-party service): preferring per-serving values over per-100g when
+  available, the gram→mg conversion for sodium/cholesterol (including a
+  precision bug caught and fixed where rounding small gram values
+  *before* the ×1000 conversion silently lost precision), serving-size
+  text parsing, category/brand cleanup, malformed/missing-field
+  responses, and — the specific bug this round of testing caught and
+  fixed — confirming that a genuine "no matches" response and an actual
+  failure (network error, timeout, HTTP 429/503) are raised as distinct
+  outcomes (`OpenFoodFactsError` vs. an empty list) rather than both
+  silently collapsing into the same "no matches" result
+- **Auto-fill highlighting**: which fields a scan/lookup actually found
+  (`present_fields` from Open Food Facts, non-None fields from OCR
+  parsing) correctly map to highlighted labels across both the core and
+  extended nutrient tables, and manually editing a highlighted value
+  correctly clears just that field's highlight without affecting others
 - **Cloud OCR engines** (Baidu Unlimited-OCR, Mistral OCR), via mocked
   `gradio_client`/`requests` calls: correct request construction
   (API name, payload shape, auth header), successful-response parsing for
@@ -511,8 +630,30 @@ pytest tests/ -v
   than crashing — plus a test confirming a cloud engine's output flows
   correctly into the same bilingual/full-nutrient parser used by local
   OCR
+- **Future-proofing fallbacks**, each verified by deliberately simulating
+  "the upstream API changed" rather than only testing the happy path:
+  Open Food Facts' SDK-method-missing → raw-REST fallback, alternate
+  response-shape keys (`hits`/`results` instead of `products`), nutrient
+  key aliasing surviving a renamed field, and SDK-constructor-signature
+  drift; Baidu's known-API-fails → runtime endpoint discovery (including
+  that it correctly matches parameters by label on a completely renamed
+  endpoint, skips non-image endpoints, and remembers which strategy
+  worked across calls); and Mistral's model-ID fallback chain (including
+  that an unrelated 400 error does *not* trigger the fallback, only a
+  genuine "model not found" does)
 
-All 150 tests pass. The app was also smoke-tested end-to-end: launched
+All 206 tests pass. The retry-with-backoff mechanism is specifically
+tested with a function that fails transiently then succeeds (confirming
+recovery), one that fails consistently (confirming it gives up after the
+documented number of attempts rather than retrying forever), and one
+that fails with a non-transient error (confirming it does *not* retry
+and fails immediately) — plus an end-to-end test confirming a search
+that hits one transient 503 still returns results normally. The
+search-caching fix is verified with Streamlit's `AppTest`: driving the
+actual search button, then a *different* widget elsewhere in the app, and
+confirming the underlying Open Food Facts call count doesn't increase
+from the unrelated interaction — while a genuinely new search term still
+correctly triggers a fresh call. The app was also smoke-tested end-to-end: launched
 headlessly from multiple working directories, confirmed a clean HTTP 200
 boot with no runtime exceptions, and run through the full image → OCR →
 parse → predict pipeline using a clear synthetic label (7/7 fields),

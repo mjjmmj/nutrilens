@@ -51,7 +51,12 @@ from modules.database import (
     get_distinct_tags,
     count_foods,
 )
-from modules.food_database_api import search_open_food_facts, ExternalFoodResult
+from modules.food_database_api import (
+    search_open_food_facts,
+    ExternalFoodResult,
+    OpenFoodFactsError,
+    check_sdk_compatibility,
+)
 from modules.cloud_ocr import (
     CloudOCRError,
     CLOUD_ENGINES,
@@ -99,6 +104,31 @@ EXTENDED_DEFAULT_FIELDS = {
     "Potassium (mg)": 0.0,
 }
 
+# Maps ParsedNutrition/ExternalFoodResult attribute names to their
+# corresponding editable-table field labels, used to translate "which
+# attributes were actually found" into "which rows to highlight as
+# auto-filled" in the UI.
+CORE_ATTR_TO_LABEL = {
+    "serving_size_g": "Serving Size (g)",
+    "calories": "Calories",
+    "total_carbs_g": "Total Carbs (g)",
+    "fiber_g": "Dietary Fiber (g)",
+    "sugars_g": "Sugars (g)",
+    "protein_g": "Protein (g)",
+    "total_fat_g": "Total Fat (g)",
+}
+EXTENDED_ATTR_TO_LABEL = {
+    "saturated_fat_g": "Saturated Fat (g)",
+    "trans_fat_g": "Trans Fat (g)",
+    "cholesterol_mg": "Cholesterol (mg)",
+    "sodium_mg": "Sodium (mg)",
+    "added_sugars_g": "Added Sugars (g)",
+    "vitamin_d_mcg": "Vitamin D (mcg)",
+    "calcium_mg": "Calcium (mg)",
+    "iron_mg": "Iron (mg)",
+    "potassium_mg": "Potassium (mg)",
+}
+
 if "nutrition_values" not in st.session_state:
     st.session_state.nutrition_values = dict(DEFAULT_FIELDS)
 if "extended_nutrition_values" not in st.session_state:
@@ -109,6 +139,27 @@ if "ocr_fields_found" not in st.session_state:
     st.session_state.ocr_fields_found = None
 if "current_source" not in st.session_state:
     st.session_state.current_source = "Manual/OCR"
+# Which field labels were successfully auto-filled by the most recent
+# scan/lookup (as opposed to left at a default or typed in by hand) --
+# drives the "Source" highlight column on both editable tables below.
+if "extracted_fields" not in st.session_state:
+    st.session_state.extracted_fields = set()
+if "extracted_fields_extended" not in st.session_state:
+    st.session_state.extracted_fields_extended = set()
+# Bumped every time nutrition_values/extended_nutrition_values are
+# overwritten programmatically (OCR scan, saved-food load, OFF load,
+# reset) and folded into the two data_editor widgets' `key` below. This
+# is what makes a manual edit register on the very first keystroke: a
+# data_editor with a *stable* key keeps its own internal edit-state
+# across reruns and can end up momentarily out of sync with a freshly
+# reconstructed DataFrame passed in as `data` on the same rerun the user
+# just edited a cell in, so the edit doesn't reliably land in
+# session_state until a second interaction. Changing the key exactly
+# when -- and only when -- we intentionally push in new values (not on
+# every rerun) forces a clean new widget instance for those cases while
+# leaving normal user-editing reruns completely undisturbed.
+if "nutrition_table_version" not in st.session_state:
+    st.session_state.nutrition_table_version = 0
 
 
 def _autocomplete_select(
@@ -197,12 +248,22 @@ def _apply_parsed_to_session(parsed: ParsedNutrition) -> None:
         "Iron (mg)": parsed.iron_mg,
         "Potassium (mg)": parsed.potassium_mg,
     }
+    extracted_core = set()
+    extracted_extended = set()
     for label, value in core_mapping.items():
         if value is not None:
             st.session_state.nutrition_values[label] = value
+            extracted_core.add(label)
     for label, value in extended_mapping.items():
         if value is not None:
             st.session_state.extended_nutrition_values[label] = value
+            extracted_extended.add(label)
+    # Reflects only what *this* scan found -- deliberately replaces
+    # rather than merges with any previous highlight, so a new scan
+    # doesn't leave stale checkmarks from an earlier one.
+    st.session_state.extracted_fields = extracted_core
+    st.session_state.extracted_fields_extended = extracted_extended
+    st.session_state.nutrition_table_version += 1
 
 
 def _load_external_result_to_session(result: ExternalFoodResult) -> None:
@@ -225,6 +286,13 @@ def _load_external_result_to_session(result: ExternalFoodResult) -> None:
     st.session_state.extended_nutrition_values["Sodium (mg)"] = result.sodium_mg
     st.session_state.raw_ocr_text = ""
     st.session_state.current_source = result.source
+    st.session_state.extracted_fields = {
+        CORE_ATTR_TO_LABEL[a] for a in result.present_fields if a in CORE_ATTR_TO_LABEL
+    }
+    st.session_state.extracted_fields_extended = {
+        EXTENDED_ATTR_TO_LABEL[a] for a in result.present_fields if a in EXTENDED_ATTR_TO_LABEL
+    }
+    st.session_state.nutrition_table_version += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +434,9 @@ with st.expander(
                         }
                         st.session_state.raw_ocr_text = ""
                         st.session_state.current_source = chosen.source or "Manual/OCR"
+                        st.session_state.extracted_fields = set()
+                        st.session_state.extracted_fields_extended = set()
+                        st.session_state.nutrition_table_version += 1
                         st.success(
                             f"Loaded '{chosen.name}' — scroll down to review and see "
                             "predictions. (It's already saved, so the save form below "
@@ -394,52 +465,97 @@ with st.expander("🌐 Search a public food database (Open Food Facts)", expande
         "crowd-sourced, double-check the values before relying on them, "
         "same as with a scanned label."
     )
-    off_query = st.text_input(
-        "Search by product name", key="off_search_query",
-        placeholder="e.g. Chobani Greek Yogurt",
-    )
-    if off_query and off_query.strip():
+    _sdk_warning = check_sdk_compatibility()
+    if _sdk_warning:
+        st.caption(f"⚠️ {_sdk_warning}")
+
+    off_search_col, off_button_col = st.columns([3, 1])
+    with off_search_col:
+        off_query = st.text_input(
+            "Search by product name", key="off_search_query",
+            placeholder="e.g. Chobani Greek Yogurt",
+        )
+    with off_button_col:
+        st.write("")  # vertical spacer to align the button with the input
+        off_search_clicked = st.button("🔍 Search", key="off_search_button")
+
+    # IMPORTANT: only call the API when the person explicitly searches (or
+    # re-searches a changed term) -- not on every script rerun. Streamlit
+    # reruns this entire script on *any* widget interaction anywhere on the
+    # page (editing a nutrition cell, changing servings, switching OCR
+    # engine, etc.), so triggering a search here unconditionally whenever
+    # the text box is non-empty was silently re-querying Open Food Facts
+    # on every unrelated interaction elsewhere in the app -- exactly the
+    # "search-as-you-type" pattern Open Food Facts explicitly asks
+    # integrators to avoid, since their search endpoint is rate-limited to
+    # 10 requests/minute/IP and returns HTTP 503 under sustained load.
+    # Caching the last-searched query + its results and only re-querying
+    # on an actual new search fixes both the redundant-request bug and
+    # makes the 503s far less likely to begin with.
+    if "off_last_query" not in st.session_state:
+        st.session_state.off_last_query = None
+        st.session_state.off_last_results = []
+        st.session_state.off_last_error = None
+
+    should_search = off_search_clicked and off_query and off_query.strip()
+    if should_search and off_query.strip() != st.session_state.off_last_query:
         with st.spinner("Searching Open Food Facts..."):
-            off_results = search_open_food_facts(off_query, page_size=10)
+            try:
+                st.session_state.off_last_results = search_open_food_facts(off_query, page_size=10)
+                st.session_state.off_last_error = None
+            except OpenFoodFactsError as exc:
+                st.session_state.off_last_results = []
+                st.session_state.off_last_error = str(exc)
+        st.session_state.off_last_query = off_query.strip()
+    elif should_search:
+        st.caption("Already showing results for this search term below.")
 
-        if not off_results:
-            st.info(
-                "No matches found (or the request failed / no internet "
-                "connection). Try a different search term, or use the "
-                "camera/manual entry below."
-            )
-        else:
-            def _format_off_result(food: ExternalFoodResult) -> str:
-                bits = [food.name]
-                if food.brand:
-                    bits.append(f"({food.brand})")
-                return " ".join(bits)
+    off_results = st.session_state.off_last_results
+    off_error = st.session_state.off_last_error
 
-            off_options_map = {_format_off_result(f): f for f in off_results}
-            off_choice_label = st.selectbox(
-                f"{len(off_results)} match(es) — pick one to load",
-                options=list(off_options_map.keys()),
-                index=None,
-                placeholder="Select a product to load its nutrition facts...",
-                key="off_result_choice",
+    if off_error:
+        st.error(
+            f"{off_error} You can try again in a moment, or use the "
+            "camera/manual entry below in the meantime."
+        )
+    elif st.session_state.off_last_query and not off_results:
+        st.info(
+            "No products matched that search term on Open Food Facts. "
+            "Try a different search term, or use the camera/manual "
+            "entry below."
+        )
+    elif off_results:
+        def _format_off_result(food: ExternalFoodResult) -> str:
+            bits = [food.name]
+            if food.brand:
+                bits.append(f"({food.brand})")
+            return " ".join(bits)
+
+        off_options_map = {_format_off_result(f): f for f in off_results}
+        off_choice_label = st.selectbox(
+            f"{len(off_results)} match(es) — pick one to load",
+            options=list(off_options_map.keys()),
+            index=None,
+            placeholder="Select a product to load its nutrition facts...",
+            key="off_result_choice",
+        )
+        if off_choice_label:
+            off_chosen = off_options_map[off_choice_label]
+            st.caption(
+                f"Per {off_chosen.serving_size_g:.0f}g — "
+                f"{off_chosen.calories:.0f} kcal, "
+                f"{off_chosen.protein_g:.1f}g protein, "
+                f"{off_chosen.total_carbs_g:.1f}g carbs, "
+                f"{off_chosen.total_fat_g:.1f}g fat"
             )
-            if off_choice_label:
-                off_chosen = off_options_map[off_choice_label]
-                st.caption(
-                    f"Per {off_chosen.serving_size_g:.0f}g — "
-                    f"{off_chosen.calories:.0f} kcal, "
-                    f"{off_chosen.protein_g:.1f}g protein, "
-                    f"{off_chosen.total_carbs_g:.1f}g carbs, "
-                    f"{off_chosen.total_fat_g:.1f}g fat"
+            if st.button("⬇️ Load into current scan", key="off_load_button"):
+                _load_external_result_to_session(off_chosen)
+                st.success(
+                    f"Loaded '{off_chosen.name}' from Open Food Facts — "
+                    "scroll down to review, correct anything that looks "
+                    "off, and see predictions."
                 )
-                if st.button("⬇️ Load into current scan", key="off_load_button"):
-                    _load_external_result_to_session(off_chosen)
-                    st.success(
-                        f"Loaded '{off_chosen.name}' from Open Food Facts — "
-                        "scroll down to review, correct anything that looks "
-                        "off, and see predictions."
-                    )
-                    st.rerun()
+                st.rerun()
 
 st.divider()
 
@@ -601,29 +717,49 @@ if captured_image is not None:
 # --------------------------------------------------------------------------- #
 
 st.subheader("2. Confirm or correct the nutrition facts")
-st.caption("Values are per serving, as printed on the label.")
+st.caption(
+    "Values are per serving, as printed on the label. "
+    "✅ = auto-filled by the last scan/lookup — please double-check these; "
+    "✏️ = default or entered manually."
+)
+
+AUTO_FILLED_LABEL = "✅ Auto-filled"
+MANUAL_LABEL = "✏️ Manual"
 
 df = pd.DataFrame(
     {
         "Field": list(st.session_state.nutrition_values.keys()),
         "Value": list(st.session_state.nutrition_values.values()),
+        "Source": [
+            AUTO_FILLED_LABEL if f in st.session_state.extracted_fields else MANUAL_LABEL
+            for f in st.session_state.nutrition_values.keys()
+        ],
     }
 )
+
+_values_before_edit = dict(st.session_state.nutrition_values)
 
 edited_df = st.data_editor(
     df,
     column_config={
         "Field": st.column_config.TextColumn("Nutrition Field", disabled=True),
         "Value": st.column_config.NumberColumn("Value", min_value=0.0, step=0.1, format="%.1f"),
+        "Source": st.column_config.TextColumn("Source", disabled=True),
     },
     hide_index=True,
     width='stretch',
-    key="nutrition_editor",
+    key=f"nutrition_editor_{st.session_state.nutrition_table_version}",
 )
 
-# Sync edits back to session state
+# Sync edits back to session state, and drop the auto-filled highlight on
+# any row the person just hand-edited to a different value -- it's a
+# manual value now, not what the scan/lookup actually found.
 for _, row in edited_df.iterrows():
-    st.session_state.nutrition_values[row["Field"]] = float(row["Value"]) if pd.notna(row["Value"]) else 0.0
+    field_label = row["Field"]
+    new_value = float(row["Value"]) if pd.notna(row["Value"]) else 0.0
+    st.session_state.nutrition_values[field_label] = new_value
+    if field_label in st.session_state.extracted_fields and new_value != _values_before_edit.get(field_label):
+        st.session_state.extracted_fields.discard(field_label)
 
 with st.expander("➕ Additional nutrients (optional)"):
     st.caption(
@@ -635,22 +771,34 @@ with st.expander("➕ Additional nutrients (optional)"):
         {
             "Field": list(st.session_state.extended_nutrition_values.keys()),
             "Value": list(st.session_state.extended_nutrition_values.values()),
+            "Source": [
+                AUTO_FILLED_LABEL if f in st.session_state.extracted_fields_extended else MANUAL_LABEL
+                for f in st.session_state.extended_nutrition_values.keys()
+            ],
         }
     )
+    _extended_values_before_edit = dict(st.session_state.extended_nutrition_values)
+
     edited_extended_df = st.data_editor(
         extended_df,
         column_config={
             "Field": st.column_config.TextColumn("Nutrition Field", disabled=True),
             "Value": st.column_config.NumberColumn("Value", min_value=0.0, step=0.1, format="%.2f"),
+            "Source": st.column_config.TextColumn("Source", disabled=True),
         },
         hide_index=True,
         width='stretch',
-        key="extended_nutrition_editor",
+        key=f"extended_nutrition_editor_{st.session_state.nutrition_table_version}",
     )
     for _, row in edited_extended_df.iterrows():
-        st.session_state.extended_nutrition_values[row["Field"]] = (
-            float(row["Value"]) if pd.notna(row["Value"]) else 0.0
-        )
+        field_label = row["Field"]
+        new_value = float(row["Value"]) if pd.notna(row["Value"]) else 0.0
+        st.session_state.extended_nutrition_values[field_label] = new_value
+        if (
+            field_label in st.session_state.extracted_fields_extended
+            and new_value != _extended_values_before_edit.get(field_label)
+        ):
+            st.session_state.extracted_fields_extended.discard(field_label)
 
 servings_consumed = st.number_input(
     "How many servings do you plan to eat?",
@@ -664,6 +812,9 @@ with reset_col:
         st.session_state.extended_nutrition_values = dict(EXTENDED_DEFAULT_FIELDS)
         st.session_state.raw_ocr_text = ""
         st.session_state.current_source = "Manual/OCR"
+        st.session_state.extracted_fields = set()
+        st.session_state.extracted_fields_extended = set()
+        st.session_state.nutrition_table_version += 1
         st.rerun()
 
 
